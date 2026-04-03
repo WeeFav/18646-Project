@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
 
     // Results file for Python plotting
     std::ofstream csv_file("results.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,Cycles\n";
+    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
 
     int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
@@ -95,22 +95,38 @@ int main(int argc, char** argv) {
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
                 PhongShader shader(light, model);
 
-                // Timing block using RDTSC 
-                tsc_counter t0, t1;
-                RDTSC(t0);
-                for (int f = 0; f < model.nfaces(); f++) {
-                    Triangle clip = {shader.vertex(f, 0), shader.vertex(f, 1), shader.vertex(f, 2)};
-                    rasterize(clip, shader, framebuffer);
-                }
-                RDTSC(t1);
+                std::vector<RasterData> raster_data(model.nfaces());
 
-                long long cycles = COUNTER_DIFF(t1, t0, CYCLES);
+                // Time all transforms together: vertex shader + NDC/screen setup.
+                tsc_counter tt0, tt1;
+                RDTSC(tt0);
+                for (int f = 0; f < model.nfaces(); f++) {
+                    Triangle clip;
+                    clip[0] = shader.vertex(f, 0);
+                    clip[1] = shader.vertex(f, 1);
+                    clip[2] = shader.vertex(f, 2);
+                    prepare_raster_data(clip, raster_data[f]);
+                }
+                RDTSC(tt1);
+
+                tsc_counter rl0, rl1;
+                RDTSC(rl0);
+                for (int f = 0; f < model.nfaces(); f++) {
+                    rasterize(raster_data[f], shader, framebuffer);
+                }
+                RDTSC(rl1);
+
+                long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
+                long long raster_loop_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
+                long long total_cycles = transform_cycles + raster_loop_cycles;
 
                 // Save metrics to CSV
                 csv_file << res << "," 
                          << eye.x << "_" << eye.y << "_" << eye.z << ","
                          << light.x << "_" << light.y << "_" << light.z << ","
-                         << cycles << "\n";
+                         << transform_cycles << ","
+                         << raster_loop_cycles << ","
+                         << total_cycles << "\n";
                 csv_file.flush(); 
 
                 // Save TGA into the specific resolution folder
@@ -121,7 +137,9 @@ int main(int argc, char** argv) {
                 std::cout << "[CONFIG] Res: " << res 
                           << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ")"
                           << " | Light: (" << light.x << ", " << light.y << ", " << light.z << ")" 
-                          << " | Cycles: " << cycles << std::endl;
+                          << " | All Transform Cycles: " << transform_cycles
+                          << " | Raster Loop Cycles: " << raster_loop_cycles
+                          << " | Total Cycles: " << total_cycles << std::endl;
             }
         }
     }

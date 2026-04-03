@@ -11,5 +11,11 @@ struct IShader {
 };
 
 typedef vec4 Triangle[3]; // a triangle primitive is made of three ordered points
-void rasterize(const Triangle &clip, const IShader &shader, TGAImage &framebuffer);
+struct RasterData {
+    vec4 ndc[3];
+    vec2 screen[3];
+};
+
+void prepare_raster_data(const Triangle &clip, RasterData &out);
+void rasterize(const RasterData &data, const IShader &shader, TGAImage &framebuffer);
 

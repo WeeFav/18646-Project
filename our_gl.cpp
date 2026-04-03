@@ -24,16 +24,25 @@ void init_zbuffer(const int width, const int height) {
     zbuffer = std::vector(width*height, -1000.);
 }
 
-void rasterize(const Triangle &clip, const IShader &shader, TGAImage &framebuffer) {
-    vec4 ndc[3]    = { clip[0]/clip[0].w, clip[1]/clip[1].w, clip[2]/clip[2].w };                // normalized device coordinates
-    vec2 screen[3] = { (Viewport*ndc[0]).xy(), (Viewport*ndc[1]).xy(), (Viewport*ndc[2]).xy() }; // screen coordinates
+void prepare_raster_data(const Triangle &clip, RasterData &out) {
+    out.ndc[0] = clip[0] / clip[0].w;
+    out.ndc[1] = clip[1] / clip[1].w;
+    out.ndc[2] = clip[2] / clip[2].w;
+    out.screen[0] = (Viewport * out.ndc[0]).xy();
+    out.screen[1] = (Viewport * out.ndc[1]).xy();
+    out.screen[2] = (Viewport * out.ndc[2]).xy();
+}
+
+void rasterize(const RasterData &data, const IShader &shader, TGAImage &framebuffer) {
+    const vec4 (&ndc)[3] = data.ndc;
+    const vec2 (&screen)[3] = data.screen;
 
     mat<3,3> ABC = {{ {screen[0].x, screen[0].y, 1.}, {screen[1].x, screen[1].y, 1.}, {screen[2].x, screen[2].y, 1.} }};
     if (ABC.det()<1) return; // backface culling + discarding triangles that cover less than a pixel
 
     auto [bbminx,bbmaxx] = std::minmax({screen[0].x, screen[1].x, screen[2].x}); // bounding box for the triangle
     auto [bbminy,bbmaxy] = std::minmax({screen[0].y, screen[1].y, screen[2].y}); // defined by its top left and bottom right corners
-#pragma omp parallel for
+// #pragma omp parallel for
     for (int x=std::max<int>(bbminx, 0); x<=std::min<int>(bbmaxx, framebuffer.width()-1); x++) {         // clip the bounding box by the screen
         for (int y=std::max<int>(bbminy, 0); y<=std::min<int>(bbmaxy, framebuffer.height()-1); y++) {
             vec3 bc = ABC.invert_transpose() * vec3{static_cast<double>(x), static_cast<double>(y), 1.}; // barycentric coordinates of {x,y} w.r.t the triangle
