@@ -5,12 +5,26 @@
 #include <fstream>
 #include <filesystem> // Required for directory creation
 #include "model.h"
+#include "tgaimage.h"
 
 namespace fs = std::filesystem;
 
-mat<4,4> ModelView, Viewport, Perspective; // "OpenGL" state matrices
+// === Structs ===
+typedef vec4 Triangle[3]; // a triangle primitive is made of three ordered points
+struct RasterData {
+    vec4 ndc[3];
+    vec2 screen[3];
+    vec3 varying_nrm[3];
+};
+
+// === Global Variables ===
+mat<4,4> ModelView, ModelViewInv, Viewport, Perspective; // "OpenGL" state matrices
 std::vector<double> zbuffer;               // depth buffer
 
+// === GPU Constant ===
+__constant__ mat<4,4> d_ModelView, d_ModelViewInv, d_Viewport, d_Perspective;
+
+// === Helper functions ====
 void lookat(const vec3 eye, const vec3 center, const vec3 up) {
     vec3 n = normalized(eye-center);
     vec3 l = normalized(cross(up,n));
@@ -31,15 +45,26 @@ void init_zbuffer(const int width, const int height) {
     zbuffer = std::vector(width*height, -1000.);
 }
 
-void prepare_raster_data(const Triangle &clip, RasterData &out) {
-    out.ndc[0] = clip[0] / clip[0].w;
-    out.ndc[1] = clip[1] / clip[1].w;
-    out.ndc[2] = clip[2] / clip[2].w;
-    out.screen[0] = (Viewport * out.ndc[0]).xy();
-    out.screen[1] = (Viewport * out.ndc[1]).xy();
-    out.screen[2] = (Viewport * out.ndc[2]).xy();
+// === GPU Kernel ===
+__global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt, int *d_facet_nrm, RasterData *d_raster_data, int nverts, int nfaces) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int face_idx = id; face_idx < nfaces; face_idx += gridDim.x * blockDim.x) {
+        Triangle clip;
+        for (int nthvert = 0; nthvert < 3; nthvert++) {
+            vec3 v = d_verts[d_facet_vrt[face_idx * 3 + nthvert]];
+            vec3 n = d_norms[d_facet_nrm[face_idx * 3 + nthvert]];
+            d_raster_data[face_idx].varying_nrm[nthvert] = (d_ModelViewInv * vec4{n.x, n.y, n.z, 0.}).xyz(); // transform normal from world to camera
+            vec4 gl_Position = d_ModelView * vec4{v.x, v.y, v.z, 1.}; // transform vertex from world to camera
+            clip[nthvert] = d_Perspective * gl_Position; // apply perspective projection
+            
+            d_raster_data[face_idx].ndc[nthvert] = clip[nthvert] / clip[nthvert].w; // camera to NDC
+            d_raster_data[face_idx].screen[nthvert] = (d_Viewport * d_raster_data[face_idx].ndc[nthvert]).xy(); // NDC to screen
+        }
+    }
 }
 
+// === Main ===
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " base_name" << std::endl;
@@ -78,5 +103,35 @@ int main(int argc, char** argv) {
     init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
     init_zbuffer(img_size, img_size);
 
+    TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
 
+    // === Vertex Transform ===
+    std::vector<RasterData> raster_data(model.nfaces());
+    vec3 *d_verts;
+    vec3 *d_norms;
+    int *d_facet_vrt;
+    int *d_facet_nrm;
+    RasterData *d_raster_data; // output
+
+    cudaMalloc(&d_verts, model.nverts() * sizeof(vec3));
+    cudaMalloc(&d_norms, model.nverts() * sizeof(vec3));
+    cudaMalloc(&d_facet_vrt, model.nfaces() * 3 * sizeof(int));
+    cudaMalloc(&d_facet_nrm, model.nfaces() * 3 * sizeof(int));
+    cudaMalloc(&d_raster_data, model.nfaces() * sizeof(RasterData));
+
+    cudaMemcpy(d_verts, model.verts.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_norms, model.norms.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_facet_vrt, model.facet_vrt.data(), model.nfaces() * 3 * sizeof(vec3), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_facet_nrm, model.facet_nrm.data(), model.nfaces() * 3 * sizeof(vec3), cudaMemcpyHostToDevice);
+    cudaMemset(d_raster_data, 0, model.nfaces() * sizeof(RasterData)); 
+
+    cudaMemcpyToSymbol(d_ModelView, &ModelView, sizeof(mat<4,4>));
+    cudaMemcpyToSymbol(d_ModelViewInv, &ModelViewInv, sizeof(mat<4,4>));
+    cudaMemcpyToSymbol(d_Viewport, &Viewport, sizeof(mat<4,4>));
+    cudaMemcpyToSymbol(d_Perspective, &Perspective, sizeof(mat<4,4>));
+
+    vertex_transform<<<4, 256, 0>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
+
+    cudaMemcpy(raster_data.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
+    
 }

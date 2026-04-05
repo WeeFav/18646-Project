@@ -2,11 +2,11 @@
 #include "geometry.h"
 
 class Model {
+public:
     std::vector<vec3> verts = {};    // array of vertices
     std::vector<vec3> norms = {};    // array of normal vectors
     std::vector<int> facet_vrt = {}; // per-triangle index in the above arrays
     std::vector<int> facet_nrm = {};
-public:
     Model(const std::string filename);
     int nverts() const; // number of vertices
     int nfaces() const; // number of triangles
