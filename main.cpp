@@ -14,6 +14,40 @@ namespace fs = std::filesystem;
 extern mat<4, 4> ModelView, Perspective;
 extern std::vector<double> zbuffer;
 
+void writeRasterData(const std::vector<RasterData>& data, const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out) {
+        throw std::runtime_error("Failed to open file");
+    }
+
+    for (size_t i = 0; i < data.size(); ++i) {
+        const RasterData& r = data[i];
+
+        out << "Triangle " << i << "\n";
+
+        for (int j = 0; j < 3; ++j) {
+            out << "  Vertex " << j << ":\n";
+
+            out << "    ndc: "
+                << r.ndc[j][0] << " "
+                << r.ndc[j][1] << " "
+                << r.ndc[j][2] << " "
+                << r.ndc[j][3] << "\n";
+
+            out << "    screen: "
+                << r.screen[j][0] << " "
+                << r.screen[j][1] << "\n";
+
+            out << "    normal: "
+                << r.varying_nrm[j][0] << " "
+                << r.varying_nrm[j][1] << " "
+                << r.varying_nrm[j][2] << "\n";
+        }
+
+        out << "\n";
+    }
+}
+
 struct PhongShader : IShader {
     const Model &model;
     vec3 l;
@@ -108,6 +142,8 @@ int main(int argc, char** argv) {
                 }
                 RDTSC(tt1);
 
+                writeRasterData(raster_data, "raster_data_baseline.txt");
+
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
                 for (int f = 0; f < model.nfaces(); f++) {
@@ -130,7 +166,7 @@ int main(int argc, char** argv) {
 
                 // Save TGA into the specific resolution folder
                 std::stringstream tga_ss;
-                tga_ss << dir_path << "/out_e" << (int)eye.x << "_l" << (int)light.x << ".tga";
+                tga_ss << dir_path << "/out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
                 std::cout << "[CONFIG] Res: " << res 

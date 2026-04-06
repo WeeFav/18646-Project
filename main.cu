@@ -6,6 +6,7 @@
 #include <filesystem> // Required for directory creation
 #include "model.h"
 #include "tgaimage.h"
+#include "geometry.h"
 
 namespace fs = std::filesystem;
 
@@ -31,6 +32,7 @@ void lookat(const vec3 eye, const vec3 center, const vec3 up) {
     vec3 m = normalized(cross(n, l));
     ModelView = mat<4,4>{{{l.x,l.y,l.z,0}, {m.x,m.y,m.z,0}, {n.x,n.y,n.z,0}, {0,0,0,1}}} *
                 mat<4,4>{{{1,0,0,-center.x}, {0,1,0,-center.y}, {0,0,1,-center.z}, {0,0,0,1}}};
+    ModelViewInv = ModelView.invert_transpose();
 }
 
 void init_perspective(const double f) {
@@ -43,6 +45,40 @@ void init_viewport(const int x, const int y, const int w, const int h) {
 
 void init_zbuffer(const int width, const int height) {
     zbuffer = std::vector(width*height, -1000.);
+}
+
+void writeRasterData(const std::vector<RasterData>& data, const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out) {
+        throw std::runtime_error("Failed to open file");
+    }
+
+    for (size_t i = 0; i < data.size(); ++i) {
+        const RasterData& r = data[i];
+
+        out << "Triangle " << i << "\n";
+
+        for (int j = 0; j < 3; ++j) {
+            out << "  Vertex " << j << ":\n";
+
+            out << "    ndc: "
+                << r.ndc[j][0] << " "
+                << r.ndc[j][1] << " "
+                << r.ndc[j][2] << " "
+                << r.ndc[j][3] << "\n";
+
+            out << "    screen: "
+                << r.screen[j][0] << " "
+                << r.screen[j][1] << "\n";
+
+            out << "    normal: "
+                << r.varying_nrm[j][0] << " "
+                << r.varying_nrm[j][1] << " "
+                << r.varying_nrm[j][2] << "\n";
+        }
+
+        out << "\n";
+    }
 }
 
 // === GPU Kernel ===
@@ -121,8 +157,8 @@ int main(int argc, char** argv) {
 
     cudaMemcpy(d_verts, model.verts.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
     cudaMemcpy(d_norms, model.norms.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_facet_vrt, model.facet_vrt.data(), model.nfaces() * 3 * sizeof(vec3), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_facet_nrm, model.facet_nrm.data(), model.nfaces() * 3 * sizeof(vec3), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_facet_vrt, model.facet_vrt.data(), model.nfaces() * 3 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_facet_nrm, model.facet_nrm.data(), model.nfaces() * 3 * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(d_raster_data, 0, model.nfaces() * sizeof(RasterData)); 
 
     cudaMemcpyToSymbol(d_ModelView, &ModelView, sizeof(mat<4,4>));
@@ -132,6 +168,11 @@ int main(int argc, char** argv) {
 
     vertex_transform<<<4, 256, 0>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
 
+    cudaDeviceSynchronize();
+
     cudaMemcpy(raster_data.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
-    
+
+    writeRasterData(raster_data, "raster_data.txt");
+
+    return 0;
 }

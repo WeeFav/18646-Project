@@ -1,7 +1,7 @@
 scale = 0.3
 
-input_file = "utah_teapot_128.obj"
-output_file = "utah_teapot_scaled_128.obj"
+input_file = "utah_teapot_16.obj"
+output_file = "utah_teapot_scaled_16.obj"
 
 with open(input_file, "r") as f_in, open(output_file, "w") as f_out:
     for line in f_in:
