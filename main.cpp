@@ -18,22 +18,21 @@ struct PhongShader : IShader {
     const Model &model;
     vec3 l;
     vec3 tri[3];
-    vec3 varying_nrm[3];
 
     PhongShader(const vec3 light, const Model &m) : model(m) {
         l = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
     }
 
-    virtual vec4 vertex(const int face, const int vert) {
+    virtual vec4 vertex(const int face, const int vert, vec3 &varying_nrm) {
         vec3 v = model.vert(face, vert);
         vec3 n = model.normal(face, vert);
-        varying_nrm[vert] = (ModelView.invert_transpose() * vec4{n.x, n.y, n.z, 0.}).xyz();
+        varying_nrm = (ModelView.invert_transpose() * vec4{n.x, n.y, n.z, 0.}).xyz();
         vec4 gl_Position = ModelView * vec4{v.x, v.y, v.z, 1.};
         tri[vert] = gl_Position.xyz();
         return Perspective * gl_Position;
     }
 
-    virtual std::pair<bool, TGAColor> fragment(const vec3 bar) const {
+    virtual std::pair<bool, TGAColor> fragment(const vec3 bar, const vec3 (&varying_nrm)[3]) const {
         TGAColor gl_FragColor = {255, 255, 255, 255};
         vec3 n = normalized(varying_nrm[0] * bar[0] + varying_nrm[1] * bar[1] + varying_nrm[2] * bar[2]);
         vec3 r = normalized(n * (n * l) * 2 - l);
@@ -61,9 +60,9 @@ int main(int argc, char** argv) {
     std::ofstream csv_file("results.csv");
     csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
 
-    int resolutions[] = {16, 32, 64, 128};
-    vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
-    vec3 light_settings[] = {{0, 1, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}};
+    int resolutions[] = {16};
+    vec3 eye_settings[] = {{0, 1, 3}};
+    vec3 light_settings[] = {{0, 1, 1}};
     vec3 center{0.065, 0.4725, 0};
     vec3 up{0, 1, 0};
 
@@ -102,9 +101,9 @@ int main(int argc, char** argv) {
                 RDTSC(tt0);
                 for (int f = 0; f < model.nfaces(); f++) {
                     Triangle clip;
-                    clip[0] = shader.vertex(f, 0);
-                    clip[1] = shader.vertex(f, 1);
-                    clip[2] = shader.vertex(f, 2);
+                    clip[0] = shader.vertex(f, 0, raster_data[f].varying_nrm[0]);
+                    clip[1] = shader.vertex(f, 1, raster_data[f].varying_nrm[1]);
+                    clip[2] = shader.vertex(f, 2, raster_data[f].varying_nrm[2]);
                     prepare_raster_data(clip, raster_data[f]);
                 }
                 RDTSC(tt1);

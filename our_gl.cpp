@@ -36,6 +36,7 @@ void prepare_raster_data(const Triangle &clip, RasterData &out) {
 void rasterize(const RasterData &data, const IShader &shader, TGAImage &framebuffer) {
     const vec4 (&ndc)[3] = data.ndc;
     const vec2 (&screen)[3] = data.screen;
+    const vec3 (&varying_nrm)[3] = data.varying_nrm;
 
     mat<3,3> ABC = {{ {screen[0].x, screen[0].y, 1.}, {screen[1].x, screen[1].y, 1.}, {screen[2].x, screen[2].y, 1.} }};
     if (ABC.det()<1) return; // backface culling + discarding triangles that cover less than a pixel
@@ -49,7 +50,7 @@ void rasterize(const RasterData &data, const IShader &shader, TGAImage &framebuf
             if (bc.x<0 || bc.y<0 || bc.z<0) continue;                                                    // negative barycentric coordinate => the pixel is outside the triangle
             double z = bc * vec3{ ndc[0].z, ndc[1].z, ndc[2].z };  // linear interpolation of the depth
             if (z <= zbuffer[x+y*framebuffer.width()]) continue;   // discard fragments that are too deep w.r.t the z-buffer
-            auto [discard, color] = shader.fragment(bc);
+            auto [discard, color] = shader.fragment(bc, varying_nrm);
             if (discard) continue;                                 // fragment shader can discard current fragment
             zbuffer[x+y*framebuffer.width()] = z;                  // update the z-buffer
             framebuffer.set(x, y, color);                          // update the framebuffer
