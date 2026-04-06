@@ -1,3 +1,5 @@
 framebuffer.tga
 *.obj
-*.txt
+
+utah_teapot_results/
+utah_teapot_results_baseline/

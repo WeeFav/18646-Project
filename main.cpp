@@ -23,28 +23,25 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
     for (size_t i = 0; i < data.size(); ++i) {
         const RasterData& r = data[i];
 
-        out << "Triangle " << i << "\n";
-
         for (int j = 0; j < 3; ++j) {
-            out << "  Vertex " << j << ":\n";
+            // Header: t<i> v<j>
+            out << "t" << i << " v" << j << "\n";
 
-            out << "    ndc: "
-                << r.ndc[j][0] << " "
+            // ndc (x y z w)
+            out << r.ndc[j][0] << " "
                 << r.ndc[j][1] << " "
                 << r.ndc[j][2] << " "
                 << r.ndc[j][3] << "\n";
 
-            out << "    screen: "
-                << r.screen[j][0] << " "
+            // screen (x y)
+            out << r.screen[j][0] << " "
                 << r.screen[j][1] << "\n";
 
-            out << "    normal: "
-                << r.varying_nrm[j][0] << " "
+            // normal (x y z)
+            out << r.varying_nrm[j][0] << " "
                 << r.varying_nrm[j][1] << " "
                 << r.varying_nrm[j][2] << "\n";
         }
-
-        out << "\n";
     }
 }
 
@@ -91,18 +88,20 @@ int main(int argc, char** argv) {
     }
 
     // Results file for Python plotting
-    std::ofstream csv_file("results.csv");
+    std::ofstream csv_file("results_baseline.csv");
     csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
 
     int resolutions[] = {16};
-    vec3 eye_settings[] = {{0, 1, 3}};
-    vec3 light_settings[] = {{0, 1, 1}};
+    vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
+    vec3 light_settings[] = {{0, 1, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}};
+    // vec3 eye_settings[] = {{0, 1, 3}};
+    // vec3 light_settings[] = {{0, 1, 1}};
     vec3 center{0.065, 0.4725, 0};
     vec3 up{0, 1, 0};
 
     for (int res : resolutions) {
         // Define the output directory path
-        std::string dir_path = base_name + "_results/res_" + std::to_string(res);
+        std::string dir_path = base_name + "_results_baseline/res_" + std::to_string(res);
         fs::create_directories(dir_path);
 
         int img_size = res * 128; 
@@ -142,7 +141,9 @@ int main(int argc, char** argv) {
                 }
                 RDTSC(tt1);
 
-                writeRasterData(raster_data, "raster_data_baseline.txt");
+                std::stringstream raster_data_ss;
+                raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
+                // writeRasterData(raster_data, raster_data_ss.str().c_str());
 
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
