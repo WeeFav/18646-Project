@@ -4,9 +4,12 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
+#include <cstdint>
 #include <thrust/scan.h>
 #include <thrust/reduce.h>
 #include <thrust/device_ptr.h>
+#include <cuda_runtime.h>
 #include "model.h"
 #include "tgaimage.h"
 #include "geometry.h"
@@ -211,6 +214,85 @@ __global__ void binning_pass2(
     }
 }
 
+__global__ void init_raster_buffers(double *d_zbuffer, uchar3 *d_colorbuffer, int npixels) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < npixels;
+         idx += gridDim.x * blockDim.x)
+    {
+        d_zbuffer[idx] = -1000.0;
+        d_colorbuffer[idx] = make_uchar3(0, 0, 0);
+    }
+}
+
+// One block rasterizes one tile; each thread handles one pixel in that tile.
+__global__ void rasterize_tiled(
+    const RasterData *d_raster_data,
+    const int        *d_tile_count,
+    const int        *d_tile_start,
+    const int        *d_triangle_list,
+    int               num_tiles_x,
+    int               tile_size,
+    int               width,
+    int               height,
+    vec3              light_cam,
+    double           *d_zbuffer,
+    uchar3           *d_colorbuffer
+) {
+    int tx = blockIdx.x;
+    int ty = blockIdx.y;
+    int tile_id = ty * num_tiles_x + tx;
+
+    int px = tx * tile_size + threadIdx.x;
+    int py = ty * tile_size + threadIdx.y;
+    if (threadIdx.x >= tile_size || threadIdx.y >= tile_size) return;
+    if (px >= width || py >= height) return;
+
+    int pix_id = px + py * width;
+    double best_z = d_zbuffer[pix_id];
+    uchar3 best_color = d_colorbuffer[pix_id];
+
+    int tri_count = d_tile_count[tile_id];
+    int tri_begin = d_tile_start[tile_id];
+
+    for (int i = 0; i < tri_count; ++i) {
+        int tri_id = d_triangle_list[tri_begin + i];
+        const RasterData &tri = d_raster_data[tri_id];
+
+        const vec2 &a = tri.screen[0];
+        const vec2 &b = tri.screen[1];
+        const vec2 &c = tri.screen[2];
+
+        double den = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (den <= 1e-12) continue;
+
+        double alpha = ((b.y - c.y) * (px - c.x) + (c.x - b.x) * (py - c.y)) / den;
+        double beta  = ((c.y - a.y) * (px - c.x) + (a.x - c.x) * (py - c.y)) / den;
+        double gamma = 1.0 - alpha - beta;
+        if (alpha < 0.0 || beta < 0.0 || gamma < 0.0) continue;
+
+        double z = alpha * tri.ndc[0].z + beta * tri.ndc[1].z + gamma * tri.ndc[2].z;
+        if (z <= best_z) continue;
+
+        vec3 n = tri.varying_nrm[0] * alpha + tri.varying_nrm[1] * beta + tri.varying_nrm[2] * gamma;
+        n = normalized(n);
+
+        double nl = n * light_cam;
+        double diff = fmax(0.0, nl);
+
+        vec3 r = normalized(n * (2.0 * nl) - light_cam);
+        double spec = pow(fmax(r.z, 0.0), 35.0);
+
+        double intensity = fmin(1.0, 0.3 + 0.4 * diff + 0.9 * spec);
+        std::uint8_t val = static_cast<std::uint8_t>(255.0 * intensity);
+
+        best_z = z;
+        best_color = make_uchar3(val, val, val);
+    }
+
+    d_zbuffer[pix_id] = best_z;
+    d_colorbuffer[pix_id] = best_color;
+}
+
 // === Main ===
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -364,21 +446,65 @@ int main(int argc, char** argv) {
                 }
 
                 RDTSC(tb1);
-
-                // d_raster_data no longer needed after binning
-                cudaFree(d_raster_data);
                 if (d_tile_cursor) cudaFree(d_tile_cursor);
-
-                // section 2.3: pass d_tile_count, d_tile_start, d_triangle_list to the
-                //       rasterization kernel (free first)
-                cudaFree(d_tile_count);
-                cudaFree(d_tile_start);
-                if (d_triangle_list) cudaFree(d_triangle_list);
 
                 // === Rasterization ===
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
+
+                int num_pixels = img_size * img_size;
+                double *d_zbuffer = nullptr;
+                uchar3 *d_colorbuffer = nullptr;
+                cudaMalloc(&d_zbuffer, num_pixels * sizeof(double));
+                cudaMalloc(&d_colorbuffer, num_pixels * sizeof(uchar3));
+
+                int init_blocks = (num_pixels + 255) / 256;
+                init_raster_buffers<<<init_blocks, 256>>>(d_zbuffer, d_colorbuffer, num_pixels);
+
+                if (total_overlaps > 0) {
+                    vec3 light_cam = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
+                    dim3 block(TILE_SIZE, TILE_SIZE);
+                    dim3 grid(num_tiles_x, num_tiles_y);
+                    rasterize_tiled<<<grid, block>>>(
+                        d_raster_data,
+                        d_tile_count,
+                        d_tile_start,
+                        d_triangle_list,
+                        num_tiles_x,
+                        TILE_SIZE,
+                        img_size,
+                        img_size,
+                        light_cam,
+                        d_zbuffer,
+                        d_colorbuffer);
+                }
+
+                cudaDeviceSynchronize();
+
+                std::vector<uchar3> h_colorbuffer(num_pixels);
+                cudaMemcpy(h_colorbuffer.data(), d_colorbuffer,
+                           num_pixels * sizeof(uchar3), cudaMemcpyDeviceToHost);
+
+                for (int y = 0; y < img_size; ++y) {
+                    for (int x = 0; x < img_size; ++x) {
+                        const uchar3 &pix = h_colorbuffer[x + y * img_size];
+                        TGAColor color = {};
+                        color[0] = pix.x;
+                        color[1] = pix.y;
+                        color[2] = pix.z;
+                        color[3] = 255;
+                        framebuffer.set(x, y, color);
+                    }
+                }
+
                 RDTSC(rl1);
+
+                cudaFree(d_zbuffer);
+                cudaFree(d_colorbuffer);
+                cudaFree(d_raster_data);
+                cudaFree(d_tile_count);
+                cudaFree(d_tile_start);
+                if (d_triangle_list) cudaFree(d_triangle_list);
 
                 long long transform_cycles   = COUNTER_DIFF(tt1, tt0, CYCLES);
                 long long binning_cycles     = COUNTER_DIFF(tb1, tb0, CYCLES);
@@ -397,7 +523,7 @@ int main(int argc, char** argv) {
 
                 // Save TGA into the specific resolution folder
                 std::stringstream tga_ss;
-                tga_ss << dir_path << "/out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
+                tga_ss << dir_path << "/gpu_out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
                 std::cout << "[CONFIG] Res: " << res
