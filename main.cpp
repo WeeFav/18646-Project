@@ -87,29 +87,27 @@ int main(int argc, char** argv) {
         base_name = base_name.substr(0, base_name.size() - 4);
     }
 
-    // Results file for Python plotting
+    // Results file for CPU baseline
     std::ofstream csv_file("results_baseline.csv");
     csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
 
-    int resolutions[] = {16};
+    int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
     vec3 light_settings[] = {{0, 1, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}};
-    // vec3 eye_settings[] = {{0, 1, 3}};
-    // vec3 light_settings[] = {{0, 1, 1}};
     vec3 center{0.065, 0.4725, 0};
     vec3 up{0, 1, 0};
 
     for (int res : resolutions) {
-        // Define the output directory path
+        // Create directory per resolution for baseline
         std::string dir_path = base_name + "_results_baseline/res_" + std::to_string(res);
         fs::create_directories(dir_path);
 
-        int img_size = res * 128; 
+        int img_size = res * 128;
         
-        // UPDATED: This now uses the full path provided in the command line argument
+        // Load the decimated model corresponding to this resolution
         std::stringstream obj_ss;
-        obj_ss << base_name << "_" << res << ".obj"; 
-        
+        obj_ss << base_name << "_" << res << ".obj";
+
         Model model(obj_ss.str().c_str());
         if (model.nfaces() == 0) {
             std::cerr << "Model " << obj_ss.str() << " not found. Skipping resolution " << res << std::endl;
@@ -126,25 +124,22 @@ int main(int argc, char** argv) {
                 
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
                 PhongShader shader(light, model);
-
                 std::vector<RasterData> raster_data(model.nfaces());
 
-                // Time all transforms together: vertex shader + NDC/screen setup.
                 tsc_counter tt0, tt1;
                 RDTSC(tt0);
+
+                // --- Vertex Transform / Prepare Raster Data ---
                 for (int f = 0; f < model.nfaces(); f++) {
                     Triangle clip;
-                    clip[0] = shader.vertex(f, 0, raster_data[f].varying_nrm[0]);
-                    clip[1] = shader.vertex(f, 1, raster_data[f].varying_nrm[1]);
-                    clip[2] = shader.vertex(f, 2, raster_data[f].varying_nrm[2]);
+                    for (int v = 0; v < 3; v++) {
+                        clip[v] = shader.vertex(f, v, raster_data[f].varying_nrm[v]);
+                    }
                     prepare_raster_data(clip, raster_data[f]);
                 }
                 RDTSC(tt1);
 
-                std::stringstream raster_data_ss;
-                raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
-                // writeRasterData(raster_data, raster_data_ss.str().c_str());
-
+                // --- Rasterization ---
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
                 for (int f = 0; f < model.nfaces(); f++) {
@@ -152,33 +147,34 @@ int main(int argc, char** argv) {
                 }
                 RDTSC(rl1);
 
+                // Cycle calculation
                 long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
                 long long raster_loop_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
                 long long total_cycles = transform_cycles + raster_loop_cycles;
 
                 // Save metrics to CSV
-                csv_file << res << "," 
+                csv_file << res << ","
                          << eye.x << "_" << eye.y << "_" << eye.z << ","
                          << light.x << "_" << light.y << "_" << light.z << ","
                          << transform_cycles << ","
                          << raster_loop_cycles << ","
                          << total_cycles << "\n";
-                csv_file.flush(); 
+                csv_file.flush();
 
-                // Save TGA into the specific resolution folder
+                // Save TGA into the specific resolution baseline folder
                 std::stringstream tga_ss;
-                tga_ss << dir_path << "/out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
+                tga_ss << dir_path << "/cpu_out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
                 std::cout << "[CONFIG] Res: " << res 
                           << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ")"
-                          << " | Light: (" << light.x << ", " << light.y << ", " << light.z << ")" 
-                          << " | All Transform Cycles: " << transform_cycles
-                          << " | Raster Loop Cycles: " << raster_loop_cycles
-                          << " | Total Cycles: " << total_cycles << std::endl;
+                          << " | Transform: " << transform_cycles 
+                          << " | Raster: " << raster_loop_cycles 
+                          << " | Total: " << total_cycles << std::endl;
             }
         }
     }
+
     csv_file.close();
     return 0;
 }
