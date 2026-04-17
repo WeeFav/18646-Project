@@ -439,7 +439,9 @@ int main(int argc, char** argv) {
                 for (int y = 0; y < img_size; ++y) {
                     for (int x = 0; x < img_size; ++x) {
                         const uchar3 &pix = h_colorbuffer[x + y * img_size];
-                        framebuffer.set(x, y, TGAColor(pix.x, pix.y, pix.z, 255));
+                        // framebuffer.set(x, y, TGAColor(pix.x, pix.y, pix.z, 255));
+			// Explicitly cast to unsigned char to match the constructor exactly
+			framebuffer.set(x, y, TGAColor{(unsigned char)pix.x, (unsigned char)pix.y, (unsigned char)pix.z, 255});
                     }
                 }
                 RDTSC(rl1);
