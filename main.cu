@@ -3,13 +3,21 @@
 #include <string>
 #include <sstream>
 #include <fstream>
-#include <filesystem> // Required for directory creation
+#include <filesystem>
+#include <algorithm>
+#include <cstdint>
+#include <thrust/scan.h>
+#include <thrust/reduce.h>
+#include <thrust/device_ptr.h>
+#include <cuda_runtime.h>
 #include "model.h"
 #include "tgaimage.h"
 #include "geometry.h"
 #include "rdtsc.h"
 
 namespace fs = std::filesystem;
+
+#define TILE_SIZE 16
 
 // === Structs ===
 typedef vec4 Triangle[3]; // a triangle primitive is made of three ordered points
@@ -79,7 +87,8 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
     }
 }
 
-// === GPU Kernel ===
+// === GPU Kernels ===
+
 __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt, int *d_facet_nrm, RasterData *d_raster_data, int nverts, int nfaces) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -102,12 +111,204 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
             d_raster_data[face_idx].varying_nrm[nthvert] = (d_ModelViewInv * vec4{n.x, n.y, n.z, 0.}).xyz(); // transform normal from world to camera
             vec4 gl_Position = d_ModelView * vec4{v.x, v.y, v.z, 1.}; // transform vertex from world to camera
             clip[nthvert] = d_Perspective * gl_Position; // apply perspective projection
+<<<<<<< HEAD
             
             vec4 ndc = clip[nthvert] / clip[nthvert].w; // camera to NDC
             d_raster_data[face_idx].ndc[nthvert] = ndc;
             d_raster_data[face_idx].screen[nthvert] = (d_Viewport * ndc).xy(); // NDC to screen
+=======
+
+            d_raster_data[face_idx].ndc[nthvert] = clip[nthvert] / clip[nthvert].w; // camera to NDC
+            d_raster_data[face_idx].screen[nthvert] = (d_Viewport * d_raster_data[face_idx].ndc[nthvert]).xy(); // NDC to screen
+>>>>>>> c5d76bf9bdbbfa4ca90f65dab19ceb1d88ea31b4
         }
     }
+}
+
+// Binning Pass 1: count how many triangles overlap each tile.
+// One thread per triangle. Mirrors the ABC.det() < 1 cull from the CPU rasterizer
+// (mat::det() is not __device__, so we compute the 3x3 determinant inline).
+//
+// Optimization: each block accumulates into a block-local shared memory copy of the
+// tile counts (shared memory atomics are ~100x faster than global memory atomics).
+// At the end, the block flushes its non-zero local counts to global with one
+// atomicAdd per (block, tile) pair instead of one per (triangle, tile) overlap.
+// Launched with dynamic shared memory = num_tiles * sizeof(int).
+__global__ void binning_pass1(
+    RasterData *d_raster_data,
+    int        *d_tile_count,
+    int         nfaces,
+    int         num_tiles_x,
+    int         num_tiles_y,
+    int         tile_size,
+    int         num_tiles       // = num_tiles_x * num_tiles_y
+) {
+    extern __shared__ int s_tile_count[]; // block-local tile count, one int per tile
+
+    // Zero-initialize; all threads share the work
+    for (int i = threadIdx.x; i < num_tiles; i += blockDim.x)
+        s_tile_count[i] = 0;
+    __syncthreads();
+
+    // Each thread processes its triangles, atomicAdd to shared memory
+    for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
+         tri_id < nfaces;
+         tri_id += gridDim.x * blockDim.x)
+    {
+        const vec2 *s = d_raster_data[tri_id].screen;
+
+        // Signed-area det of ABC (same formula as our_gl.cpp: ABC.det() < 1)
+        // Rows of ABC are {s[i].x, s[i].y, 1}; expanding the 3x3 determinant:
+        double det = s[0].x * (s[1].y - s[2].y)
+                   + s[1].x * (s[2].y - s[0].y)
+                   + s[2].x * (s[0].y - s[1].y);
+        if (det < 1.0) continue;
+
+        // Screen-space bounding box
+        double bbminx = fmin(s[0].x, fmin(s[1].x, s[2].x));
+        double bbmaxx = fmax(s[0].x, fmax(s[1].x, s[2].x));
+        double bbminy = fmin(s[0].y, fmin(s[1].y, s[2].y));
+        double bbmaxy = fmax(s[0].y, fmax(s[1].y, s[2].y));
+
+        // Tile range, clamped to valid tile indices
+        int tx_min = max(0,              (int)floor(bbminx / tile_size));
+        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_size));
+        int ty_min = max(0,              (int)floor(bbminy / tile_size));
+        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_size));
+
+        for (int ty = ty_min; ty <= ty_max; ty++)
+            for (int tx = tx_min; tx <= tx_max; tx++)
+                atomicAdd(&s_tile_count[ty * num_tiles_x + tx], 1); // shared, not global
+    }
+    __syncthreads(); // all threads done writing to shared mem before flush
+
+    // Flush block-local counts to global memory.
+    // The if condition check skips tiles this block never touched, avoiding unnecessary
+    // global atomics for the many tiles that have no triangles assigned.
+    for (int i = threadIdx.x; i < num_tiles; i += blockDim.x)
+        if (s_tile_count[i] > 0)
+            atomicAdd(&d_tile_count[i], s_tile_count[i]);
+}
+
+// Binning Pass 2: scatter triangle IDs into the flat triangle_list.
+// d_tile_cursor is a mutable copy of d_tile_start; atomicAdd on it gives each
+// thread a unique slot without overwriting d_tile_start (which the rasterization
+// kernel reads to locate each tile's list).
+__global__ void binning_pass2(
+    RasterData *d_raster_data,
+    int        *d_tile_cursor,
+    int        *d_triangle_list,
+    int         nfaces,
+    int         num_tiles_x,
+    int         num_tiles_y,
+    int         tile_size
+) {
+    for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
+         tri_id < nfaces;
+         tri_id += gridDim.x * blockDim.x)
+    {
+        const vec2 *s = d_raster_data[tri_id].screen;
+
+        double det = s[0].x * (s[1].y - s[2].y)
+                   + s[1].x * (s[2].y - s[0].y)
+                   + s[2].x * (s[0].y - s[1].y);
+        if (det < 1.0) continue;
+
+        double bbminx = fmin(s[0].x, fmin(s[1].x, s[2].x));
+        double bbmaxx = fmax(s[0].x, fmax(s[1].x, s[2].x));
+        double bbminy = fmin(s[0].y, fmin(s[1].y, s[2].y));
+        double bbmaxy = fmax(s[0].y, fmax(s[1].y, s[2].y));
+
+        int tx_min = max(0,              (int)floor(bbminx / tile_size));
+        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_size));
+        int ty_min = max(0,              (int)floor(bbminy / tile_size));
+        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_size));
+
+        for (int ty = ty_min; ty <= ty_max; ty++)
+            for (int tx = tx_min; tx <= tx_max; tx++) {
+                int pos = atomicAdd(&d_tile_cursor[ty * num_tiles_x + tx], 1);
+                d_triangle_list[pos] = tri_id;
+            }
+    }
+}
+
+__global__ void init_raster_buffers(double *d_zbuffer, uchar3 *d_colorbuffer, int npixels) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < npixels;
+         idx += gridDim.x * blockDim.x)
+    {
+        d_zbuffer[idx] = -1000.0;
+        d_colorbuffer[idx] = make_uchar3(0, 0, 0);
+    }
+}
+
+// One block rasterizes one tile; each thread handles one pixel in that tile.
+__global__ void rasterize_tiled(
+    const RasterData *d_raster_data,
+    const int        *d_tile_count,
+    const int        *d_tile_start,
+    const int        *d_triangle_list,
+    int               num_tiles_x,
+    int               tile_size,
+    int               width,
+    int               height,
+    vec3              light_cam,
+    double           *d_zbuffer,
+    uchar3           *d_colorbuffer
+) {
+    int tx = blockIdx.x;
+    int ty = blockIdx.y;
+    int tile_id = ty * num_tiles_x + tx;
+
+    int px = tx * tile_size + threadIdx.x;
+    int py = ty * tile_size + threadIdx.y;
+    if (threadIdx.x >= tile_size || threadIdx.y >= tile_size) return;
+    if (px >= width || py >= height) return;
+
+    int pix_id = px + py * width;
+    double best_z = d_zbuffer[pix_id];
+    uchar3 best_color = d_colorbuffer[pix_id];
+
+    int tri_count = d_tile_count[tile_id];
+    int tri_begin = d_tile_start[tile_id];
+
+    for (int i = 0; i < tri_count; ++i) {
+        int tri_id = d_triangle_list[tri_begin + i];
+        const RasterData &tri = d_raster_data[tri_id];
+
+        const vec2 &a = tri.screen[0];
+        const vec2 &b = tri.screen[1];
+        const vec2 &c = tri.screen[2];
+
+        double den = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (den <= 1e-12) continue;
+
+        double alpha = ((b.y - c.y) * (px - c.x) + (c.x - b.x) * (py - c.y)) / den;
+        double beta  = ((c.y - a.y) * (px - c.x) + (a.x - c.x) * (py - c.y)) / den;
+        double gamma = 1.0 - alpha - beta;
+        if (alpha < 0.0 || beta < 0.0 || gamma < 0.0) continue;
+
+        double z = alpha * tri.ndc[0].z + beta * tri.ndc[1].z + gamma * tri.ndc[2].z;
+        if (z <= best_z) continue;
+
+        vec3 n = tri.varying_nrm[0] * alpha + tri.varying_nrm[1] * beta + tri.varying_nrm[2] * gamma;
+        n = normalized(n);
+
+        double nl = n * light_cam;
+        double diff = fmax(0.0, nl);
+
+        vec3 r = normalized(n * (2.0 * nl) - light_cam);
+        double spec = pow(fmax(r.z, 0.0), 35.0);
+
+        double intensity = fmin(1.0, 0.3 + 0.4 * diff + 0.9 * spec);
+        std::uint8_t val = static_cast<std::uint8_t>(255.0 * intensity);
+
+        best_z = z;
+        best_color = make_uchar3(val, val, val);
+    }
+
+    d_zbuffer[pix_id] = best_z;
+    d_colorbuffer[pix_id] = best_color;
 }
 
 // === Main ===
@@ -124,7 +325,7 @@ int main(int argc, char** argv) {
 
     // Results file for Python plotting
     std::ofstream csv_file("results.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
+    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Binning_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
 
     int resolutions[] = {16};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
@@ -136,13 +337,13 @@ int main(int argc, char** argv) {
         // Define the output directory path
         std::string dir_path = base_name + "_results/res_" + std::to_string(res);
         fs::create_directories(dir_path);
-        
-        int img_size = res * 128; 
-        
+
+        int img_size = res * 128;
+
         // UPDATED: This now uses the full path provided in the command line argument
         std::stringstream obj_ss;
-        obj_ss << base_name << "_" << res << ".obj"; 
-    
+        obj_ss << base_name << "_" << res << ".obj";
+
         Model model(obj_ss.str().c_str());
         if (model.nfaces() == 0) {
             std::cerr << "Model " << obj_ss.str() << " not found. Skipping resolution " << res << std::endl;
@@ -156,7 +357,7 @@ int main(int argc, char** argv) {
                 init_perspective(norm(eye - center));
                 init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
                 init_zbuffer(img_size, img_size);
-                
+
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
                 std::vector<RasterData> raster_data(model.nfaces());
 
@@ -180,16 +381,21 @@ int main(int argc, char** argv) {
                 cudaMemcpy(d_norms, model.norms.data(), model.norms.size() * sizeof(vec3), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_facet_vrt, model.facet_vrt.data(), model.nfaces() * 3 * sizeof(int), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_facet_nrm, model.facet_nrm.data(), model.nfaces() * 3 * sizeof(int), cudaMemcpyHostToDevice);
-                cudaMemset(d_raster_data, 0, model.nfaces() * sizeof(RasterData)); 
- 
+                cudaMemset(d_raster_data, 0, model.nfaces() * sizeof(RasterData));
+
                 cudaMemcpyToSymbol(d_ModelView, &ModelView, sizeof(mat<4,4>));
                 cudaMemcpyToSymbol(d_ModelViewInv, &ModelViewInv, sizeof(mat<4,4>));
                 cudaMemcpyToSymbol(d_Viewport, &Viewport, sizeof(mat<4,4>));
                 cudaMemcpyToSymbol(d_Perspective, &Perspective, sizeof(mat<4,4>));
 
                 vertex_transform<<<256, 256>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
-
                 cudaDeviceSynchronize();
+
+                // Vertex inputs no longer needed; free them before binning
+                cudaFree(d_verts);
+                cudaFree(d_norms);
+                cudaFree(d_facet_vrt);
+                cudaFree(d_facet_nrm);
 
                 cudaMemcpy(raster_data.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
 
@@ -199,6 +405,7 @@ int main(int argc, char** argv) {
                 raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
                 writeRasterData(raster_data, raster_data_ss.str().c_str());
 
+<<<<<<< HEAD
                 
 
 
@@ -207,33 +414,153 @@ int main(int argc, char** argv) {
                 cudaFree(d_facet_vrt);
                 cudaFree(d_facet_nrm);
                 cudaFree(d_raster_data);
+=======
+                // === Tiled Binning ===
+                tsc_counter tb0, tb1;
+                RDTSC(tb0);
+>>>>>>> c5d76bf9bdbbfa4ca90f65dab19ceb1d88ea31b4
 
+                int num_tiles_x = img_size / TILE_SIZE;
+                int num_tiles_y = img_size / TILE_SIZE;
+                int num_tiles   = num_tiles_x * num_tiles_y;
+
+                // Allocate and zero-initialize per-tile triangle counts
+                int *d_tile_count;
+                cudaMalloc(&d_tile_count, num_tiles * sizeof(int));
+                cudaMemset(d_tile_count, 0, num_tiles * sizeof(int));
+
+                // Pass 1: count triangle-tile overlaps
+                // Dynamic shared memory: one int per tile for block-local accumulation.
+                // cudaFuncSetAttribute raises the per-block shared memory limit above
+                // the default 48 KB so the full tile array fits (up to 64 KB on T4).
+                int nblocks_bin  = (model.nfaces() + 255) / 256;
+                int smem_pass1   = num_tiles * (int)sizeof(int);
+                cudaFuncSetAttribute(binning_pass1,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_pass1);
+                binning_pass1<<<nblocks_bin, 256, smem_pass1>>>(
+                    d_raster_data, d_tile_count,
+                    model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE, num_tiles);
+                cudaDeviceSynchronize();
+
+                // Prefix sum: tile_count[] -> tile_start[] (exclusive scan)
+                int *d_tile_start;
+                cudaMalloc(&d_tile_start, num_tiles * sizeof(int));
+                thrust::exclusive_scan(
+                    thrust::device_ptr<int>(d_tile_count),
+                    thrust::device_ptr<int>(d_tile_count + num_tiles),
+                    thrust::device_ptr<int>(d_tile_start));
+
+                // Total triangle-tile overlap entries needed for triangle_list
+                int total_overlaps = thrust::reduce(
+                    thrust::device_ptr<int>(d_tile_count),
+                    thrust::device_ptr<int>(d_tile_count + num_tiles));
+
+                // Pass 2: scatter triangle IDs into flat triangle_list
+                int *d_triangle_list = nullptr;
+                int *d_tile_cursor   = nullptr;
+                if (total_overlaps > 0) {
+                    cudaMalloc(&d_triangle_list, total_overlaps * sizeof(int));
+
+                    // d_tile_cursor is a mutable working copy of d_tile_start;
+                    // Pass 2 atomicAdd's into it to assign unique slots per tile.
+                    // d_tile_start is preserved unchanged for the rasterization kernel.
+                    cudaMalloc(&d_tile_cursor, num_tiles * sizeof(int));
+                    cudaMemcpy(d_tile_cursor, d_tile_start,
+                               num_tiles * sizeof(int), cudaMemcpyDeviceToDevice);
+
+                    binning_pass2<<<nblocks_bin, 256>>>(
+                        d_raster_data, d_tile_cursor, d_triangle_list,
+                        model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE);
+                    cudaDeviceSynchronize();
+                }
+
+                RDTSC(tb1);
+                if (d_tile_cursor) cudaFree(d_tile_cursor);
+
+                // === Rasterization ===
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
+
+                int num_pixels = img_size * img_size;
+                double *d_zbuffer = nullptr;
+                uchar3 *d_colorbuffer = nullptr;
+                cudaMalloc(&d_zbuffer, num_pixels * sizeof(double));
+                cudaMalloc(&d_colorbuffer, num_pixels * sizeof(uchar3));
+
+                int init_blocks = (num_pixels + 255) / 256;
+                init_raster_buffers<<<init_blocks, 256>>>(d_zbuffer, d_colorbuffer, num_pixels);
+
+                if (total_overlaps > 0) {
+                    vec3 light_cam = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
+                    dim3 block(TILE_SIZE, TILE_SIZE);
+                    dim3 grid(num_tiles_x, num_tiles_y);
+                    rasterize_tiled<<<grid, block>>>(
+                        d_raster_data,
+                        d_tile_count,
+                        d_tile_start,
+                        d_triangle_list,
+                        num_tiles_x,
+                        TILE_SIZE,
+                        img_size,
+                        img_size,
+                        light_cam,
+                        d_zbuffer,
+                        d_colorbuffer);
+                }
+
+                cudaDeviceSynchronize();
+
+                std::vector<uchar3> h_colorbuffer(num_pixels);
+                cudaMemcpy(h_colorbuffer.data(), d_colorbuffer,
+                           num_pixels * sizeof(uchar3), cudaMemcpyDeviceToHost);
+
+                for (int y = 0; y < img_size; ++y) {
+                    for (int x = 0; x < img_size; ++x) {
+                        const uchar3 &pix = h_colorbuffer[x + y * img_size];
+                        TGAColor color = {};
+                        color[0] = pix.x;
+                        color[1] = pix.y;
+                        color[2] = pix.z;
+                        color[3] = 255;
+                        framebuffer.set(x, y, color);
+                    }
+                }
+
                 RDTSC(rl1);
-                
-                long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
+
+                cudaFree(d_zbuffer);
+                cudaFree(d_colorbuffer);
+                cudaFree(d_raster_data);
+                cudaFree(d_tile_count);
+                cudaFree(d_tile_start);
+                if (d_triangle_list) cudaFree(d_triangle_list);
+
+                long long transform_cycles   = COUNTER_DIFF(tt1, tt0, CYCLES);
+                long long binning_cycles     = COUNTER_DIFF(tb1, tb0, CYCLES);
                 long long raster_loop_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
-                long long total_cycles = transform_cycles + raster_loop_cycles;
-                
+                long long total_cycles = transform_cycles + binning_cycles + raster_loop_cycles;
+
                 // Save metrics to CSV
-                csv_file << res << "," 
+                csv_file << res << ","
                          << eye.x << "_" << eye.y << "_" << eye.z << ","
                          << light.x << "_" << light.y << "_" << light.z << ","
                          << transform_cycles << ","
+                         << binning_cycles << ","
                          << raster_loop_cycles << ","
                          << total_cycles << "\n";
-                csv_file.flush(); 
-                
+                csv_file.flush();
+
                 // Save TGA into the specific resolution folder
                 std::stringstream tga_ss;
-                tga_ss << dir_path << "/out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
+                tga_ss << dir_path << "/gpu_out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
-                std::cout << "[CONFIG] Res: " << res 
+                std::cout << "[CONFIG] Res: " << res
                           << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ")"
-                          << " | Light: (" << light.x << ", " << light.y << ", " << light.z << ")" 
-                          << " | All Transform Cycles: " << transform_cycles
+                          << " | Light: (" << light.x << ", " << light.y << ", " << light.z << ")"
+                          << " | Transform Cycles: " << transform_cycles
+                          << " | Binning Cycles: " << binning_cycles
+                          << " | Total Overlaps: " << total_overlaps
                           << " | Raster Loop Cycles: " << raster_loop_cycles
                           << " | Total Cycles: " << total_cycles << std::endl;
             }
