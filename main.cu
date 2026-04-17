@@ -83,7 +83,18 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
 __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt, int *d_facet_nrm, RasterData *d_raster_data, int nverts, int nfaces) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
-    for (int face_idx = id; face_idx < nfaces; face_idx += gridDim.x * blockDim.x) {
+    int iterations = nfaces / (gridDim.x * blockDim.x);
+    int remainder = nfaces % (gridDim.x * blockDim.x);
+    
+    int start;
+    if (id < remainder) {
+        start = (iterations + 1) * id;
+    }
+    else {
+        start = (iterations * id) + remainder;
+    }
+
+    for (int face_idx = start; face_idx < start + iterations + (id < remainder); face_idx++) {
         Triangle clip;
         for (int nthvert = 0; nthvert < 3; nthvert++) {
             vec3 v = d_verts[d_facet_vrt[face_idx * 3 + nthvert]];
@@ -92,8 +103,9 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
             vec4 gl_Position = d_ModelView * vec4{v.x, v.y, v.z, 1.}; // transform vertex from world to camera
             clip[nthvert] = d_Perspective * gl_Position; // apply perspective projection
             
-            d_raster_data[face_idx].ndc[nthvert] = clip[nthvert] / clip[nthvert].w; // camera to NDC
-            d_raster_data[face_idx].screen[nthvert] = (d_Viewport * d_raster_data[face_idx].ndc[nthvert]).xy(); // NDC to screen
+            vec4 ndc = clip[nthvert] / clip[nthvert].w; // camera to NDC
+            d_raster_data[face_idx].ndc[nthvert] = ndc;
+            d_raster_data[face_idx].screen[nthvert] = (d_Viewport * ndc).xy(); // NDC to screen
         }
     }
 }
@@ -186,6 +198,9 @@ int main(int argc, char** argv) {
                 std::stringstream raster_data_ss;
                 raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
                 writeRasterData(raster_data, raster_data_ss.str().c_str());
+
+                
+
 
                 cudaFree(d_verts);
                 cudaFree(d_norms);
