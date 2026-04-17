@@ -111,16 +111,10 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
             d_raster_data[face_idx].varying_nrm[nthvert] = (d_ModelViewInv * vec4{n.x, n.y, n.z, 0.}).xyz(); // transform normal from world to camera
             vec4 gl_Position = d_ModelView * vec4{v.x, v.y, v.z, 1.}; // transform vertex from world to camera
             clip[nthvert] = d_Perspective * gl_Position; // apply perspective projection
-<<<<<<< HEAD
             
             vec4 ndc = clip[nthvert] / clip[nthvert].w; // camera to NDC
             d_raster_data[face_idx].ndc[nthvert] = ndc;
             d_raster_data[face_idx].screen[nthvert] = (d_Viewport * ndc).xy(); // NDC to screen
-=======
-
-            d_raster_data[face_idx].ndc[nthvert] = clip[nthvert] / clip[nthvert].w; // camera to NDC
-            d_raster_data[face_idx].screen[nthvert] = (d_Viewport * d_raster_data[face_idx].ndc[nthvert]).xy(); // NDC to screen
->>>>>>> c5d76bf9bdbbfa4ca90f65dab19ceb1d88ea31b4
         }
     }
 }
@@ -405,7 +399,6 @@ int main(int argc, char** argv) {
                 raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
                 writeRasterData(raster_data, raster_data_ss.str().c_str());
 
-<<<<<<< HEAD
                 
 
 
@@ -414,11 +407,9 @@ int main(int argc, char** argv) {
                 cudaFree(d_facet_vrt);
                 cudaFree(d_facet_nrm);
                 cudaFree(d_raster_data);
-=======
                 // === Tiled Binning ===
                 tsc_counter tb0, tb1;
                 RDTSC(tb0);
->>>>>>> c5d76bf9bdbbfa4ca90f65dab19ceb1d88ea31b4
 
                 int num_tiles_x = img_size / TILE_SIZE;
                 int num_tiles_y = img_size / TILE_SIZE;
