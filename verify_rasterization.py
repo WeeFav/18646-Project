@@ -128,7 +128,7 @@ def compare_images(gpu_path, cpu_path, tolerance=2):
 
 def main():
     # base_dir = Path('/Users/stevenymchang/Desktop/Fast Code II/18646-Project')
-    base_dir = Path('/private/18646-Project')
+    base_dir = Path('~/private/18646-Project').expanduser()
     gpu_results = base_dir / 'utah_teapot_results'
     cpu_results = base_dir / 'utah_teapot_results_baseline'
 
