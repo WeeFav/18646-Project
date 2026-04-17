@@ -399,14 +399,6 @@ int main(int argc, char** argv) {
                 raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
                 writeRasterData(raster_data, raster_data_ss.str().c_str());
 
-                
-
-
-                cudaFree(d_verts);
-                cudaFree(d_norms);
-                cudaFree(d_facet_vrt);
-                cudaFree(d_facet_nrm);
-                cudaFree(d_raster_data);
                 // === Tiled Binning ===
                 tsc_counter tb0, tb1;
                 RDTSC(tb0);
@@ -524,6 +516,7 @@ int main(int argc, char** argv) {
                 cudaFree(d_raster_data);
                 cudaFree(d_tile_count);
                 cudaFree(d_tile_start);
+		cudaFree(d_raster_data);
                 if (d_triangle_list) cudaFree(d_triangle_list);
 
                 long long transform_cycles   = COUNTER_DIFF(tt1, tt0, CYCLES);
