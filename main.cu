@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
     }
 
     std::ofstream csv_file("results.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Binning_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
+    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Binning_Cycles,Raster_Pure_Cycles,Reformat_Cycles,Total_Cycles\n";
 
     int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
@@ -367,12 +367,12 @@ int main(int argc, char** argv) {
                 vertex_transform<<<256, 256>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
                 cudaDeviceSynchronize();
                 
-                cudaMemcpy(raster_data_host.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
+                // cudaMemcpy(raster_data_host.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
                 RDTSC(tt1);
 
-                std::stringstream raster_data_ss;
-                raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
-                writeRasterData(raster_data_host, raster_data_ss.str().c_str());
+                // std::stringstream raster_data_ss;
+                // raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
+                // writeRasterData(raster_data_host, raster_data_ss.str().c_str());
 
                 // Binning
                 tsc_counter tb0, tb1;
@@ -410,33 +410,37 @@ int main(int argc, char** argv) {
 
                 std::vector<uchar3> h_colorbuffer(num_pixels);
                 cudaMemcpy(h_colorbuffer.data(), d_colorbuffer, num_pixels * sizeof(uchar3), cudaMemcpyDeviceToHost);
+                RDTSC(rl1);
 
+                tsc_counter rf0, rf1;
+                RDTSC(rf0);
                 for (int y = 0; y < img_size; ++y) {
                     for (int x = 0; x < img_size; ++x) {
                         const uchar3 &pix = h_colorbuffer[x + y * img_size];
                         // framebuffer.set(x, y, TGAColor(pix.x, pix.y, pix.z, 255));
-			// Explicitly cast to unsigned char to match the constructor exactly
-			framebuffer.set(x, y, TGAColor{(unsigned char)pix.x, (unsigned char)pix.y, (unsigned char)pix.z, 255});
+                        // Explicitly cast to unsigned char to match the constructor exactly
+                        framebuffer.set(x, y, TGAColor{(unsigned char)pix.x, (unsigned char)pix.y, (unsigned char)pix.z, 255});
                     }
                 }
-                RDTSC(rl1);
+                RDTSC(rf1);
 
                 if (d_triangle_list) cudaFree(d_triangle_list);
 
                 // logging
                 long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
                 long long binning_cycles = COUNTER_DIFF(tb1, tb0, CYCLES);
-                long long raster_loop_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
-                long long total_cycles = transform_cycles + binning_cycles + raster_loop_cycles;
+                long long raster_pure_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
+                long long reformat_cycles = COUNTER_DIFF(rf1, rf0, CYCLES);
+                long long total_cycles = transform_cycles + binning_cycles + raster_pure_cycles + reformat_cycles;
 
-                csv_file << res << "," << eye.x << "_" << eye.y << "_" << eye.z << "," << light.x << "_" << light.y << "_" << light.z << "," << transform_cycles << "," << binning_cycles << "," << raster_loop_cycles << "," << total_cycles << "\n";
+                csv_file << res << "," << eye.x << "_" << eye.y << "_" << eye.z << "," << light.x << "_" << light.y << "_" << light.z << "," << transform_cycles << "," << binning_cycles << "," << raster_pure_cycles << "," << reformat_cycles << "," << total_cycles << "\n";
                 csv_file.flush();
 
                 std::stringstream tga_ss;
                 tga_ss << dir_path << "/gpu_out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
-                std::cout << "[CONFIG] Res: " << res << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ") | Transform: " << transform_cycles << " | Binning: " << binning_cycles << " | Raster: " << raster_loop_cycles << " | Total: " << total_cycles << std::endl;
+                std::cout << "[CONFIG] Res: " << res << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ") | Transform: " << transform_cycles << " | Binning: " << binning_cycles << " | Raster: " << raster_pure_cycles << " | Reformat: " << reformat_cycles << " | Total: " << total_cycles << std::endl;
             }
         }
         // cleanup per resolution

@@ -159,7 +159,7 @@ def main():
         # Construct corresponding CPU baseline path
         rel_path = gpu_img.relative_to(gpu_results)
         # Strip "gpu_" prefix from filename for CPU baseline
-        filename = rel_path.name.replace('gpu_out_', 'out_')
+        filename = rel_path.name.replace('gpu_out_', 'cpu_out_')
         cpu_img = cpu_results / rel_path.parent / filename
 
         if not cpu_img.exists():
