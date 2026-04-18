@@ -122,28 +122,14 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
 // Binning Pass 1: count how many triangles overlap each tile.
 // One thread per triangle. Mirrors the ABC.det() < 1 cull from the CPU rasterizer
 // (mat::det() is not __device__, so we compute the 3x3 determinant inline).
-//
-// Optimization: each block accumulates into a block-local shared memory copy of the
-// tile counts (shared memory atomics are ~100x faster than global memory atomics).
-// At the end, the block flushes its non-zero local counts to global with one
-// atomicAdd per (block, tile) pair instead of one per (triangle, tile) overlap.
-// Launched with dynamic shared memory = num_tiles * sizeof(int).
 __global__ void binning_pass1(
     RasterData *d_raster_data,
     int        *d_tile_count,
     int         nfaces,
     int         num_tiles_x,
     int         num_tiles_y,
-    int         tile_size,
-    int         num_tiles       // = num_tiles_x * num_tiles_y
+    int         tile_size
 ) {
-    extern __shared__ int s_tile_count[]; // block-local tile count, one int per tile
-
-    // Zero-initialize; all threads share the work
-    for (int i = threadIdx.x; i < num_tiles; i += blockDim.x)
-        s_tile_count[i] = 0;
-    __syncthreads();
-
     // Each thread processes its triangles, atomicAdd to shared memory
     for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
          tri_id < nfaces;
@@ -172,16 +158,8 @@ __global__ void binning_pass1(
 
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++)
-                atomicAdd(&s_tile_count[ty * num_tiles_x + tx], 1); // shared, not global
+                atomicAdd(&d_tile_count[ty * num_tiles_x + tx], 1); // shared, not global
     }
-    __syncthreads(); // all threads done writing to shared mem before flush
-
-    // Flush block-local counts to global memory.
-    // The if condition check skips tiles this block never touched, avoiding unnecessary
-    // global atomics for the many tiles that have no triangles assigned.
-    for (int i = threadIdx.x; i < num_tiles; i += blockDim.x)
-        if (s_tile_count[i] > 0)
-            atomicAdd(&d_tile_count[i], s_tile_count[i]);
 }
 
 // Binning Pass 2: scatter triangle IDs into the flat triangle_list.
@@ -402,10 +380,7 @@ int main(int argc, char** argv) {
                 cudaMemset(d_tile_count, 0, num_tiles * sizeof(int));
 
                 int nblocks_bin = (model.nfaces() + 255) / 256;
-                int smem_pass1 = num_tiles * (int)sizeof(int);
-                cudaFuncSetAttribute(binning_pass1, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_pass1);
-                
-                binning_pass1<<<nblocks_bin, 256, smem_pass1>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE, num_tiles);
+                binning_pass1<<<nblocks_bin, 256>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE);
                 
                 thrust::exclusive_scan(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles), thrust::device_ptr<int>(d_tile_start));
                 int total_overlaps = thrust::reduce(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles));
