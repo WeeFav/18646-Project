@@ -4,8 +4,8 @@ build_gpu:
 run_gpu:
 	./main.x utah_teapot
 
-build_baseline:
+build_cpu:
 	cd build/ && cmake --build .
 
-run_baseline:
+run_cpu:
 	./build/tinyrenderer utah_teapot

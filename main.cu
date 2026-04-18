@@ -20,7 +20,7 @@ namespace fs = std::filesystem;
 #define TILE_SIZE 16
 
 // === Structs ===
-typedef vec4 Triangle[3]; // a triangle primitive is made of three ordered points
+typedef vec4 Triangle[3];
 struct RasterData {
     vec4 ndc[3];
     vec2 screen[3];
@@ -158,7 +158,7 @@ __global__ void binning_pass1(
 
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++)
-                atomicAdd(&d_tile_count[ty * num_tiles_x + tx], 1); // shared, not global
+                atomicAdd(&d_tile_count[ty * num_tiles_x + tx], 1);
     }
 }
 
@@ -204,13 +204,15 @@ __global__ void binning_pass2(
     }
 }
 
-__global__ void init_raster_buffers(double *d_zbuffer, uchar3 *d_colorbuffer, int npixels) {
+__global__ void init_raster_buffers(double *d_zbuffer, unsigned char *d_colorbuffer, int npixels) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < npixels;
          idx += gridDim.x * blockDim.x)
     {
         d_zbuffer[idx] = -1000.0;
-        d_colorbuffer[idx] = make_uchar3(0, 0, 0);
+        d_colorbuffer[idx * 3 + 0] = 0;
+        d_colorbuffer[idx * 3 + 1] = 0;
+        d_colorbuffer[idx * 3 + 2] = 0;
     }
 }
 
@@ -226,7 +228,7 @@ __global__ void rasterize_tiled(
     int               height,
     vec3              light_cam,
     double           *d_zbuffer,
-    uchar3           *d_colorbuffer
+    unsigned char    *d_colorbuffer
 ) {
     int tx = blockIdx.x;
     int ty = blockIdx.y;
@@ -239,7 +241,7 @@ __global__ void rasterize_tiled(
 
     int pix_id = px + py * width;
     double best_z = d_zbuffer[pix_id];
-    uchar3 best_color = d_colorbuffer[pix_id];
+    unsigned char best_color[3] = {d_colorbuffer[pix_id * 3 + 0], d_colorbuffer[pix_id * 3 + 1], d_colorbuffer[pix_id * 3 + 2]};
 
     int tri_count = d_tile_count[tile_id];
     int tri_begin = d_tile_start[tile_id];
@@ -276,11 +278,15 @@ __global__ void rasterize_tiled(
         std::uint8_t val = static_cast<std::uint8_t>(255.0 * intensity);
 
         best_z = z;
-        best_color = make_uchar3(val, val, val);
+        best_color[0] = val;
+        best_color[1] = val;
+        best_color[2] = val;
     }
 
     d_zbuffer[pix_id] = best_z;
-    d_colorbuffer[pix_id] = best_color;
+    d_colorbuffer[pix_id * 3 + 0] = best_color[0];
+    d_colorbuffer[pix_id * 3 + 1] = best_color[1];
+    d_colorbuffer[pix_id * 3 + 2] = best_color[2];
 }
 
 // === Main ===
@@ -323,7 +329,7 @@ int main(int argc, char** argv) {
         vec3 *d_verts, *d_norms;
         int *d_facet_vrt, *d_facet_nrm;
         double *d_zbuffer;
-        uchar3 *d_colorbuffer;
+        unsigned char *d_colorbuffer;
         int *d_tile_count, *d_tile_start;
 
         int num_pixels = img_size * img_size;
@@ -337,7 +343,7 @@ int main(int argc, char** argv) {
         cudaMalloc(&d_facet_vrt, model.nfaces() * 3 * sizeof(int));
         cudaMalloc(&d_facet_nrm, model.nfaces() * 3 * sizeof(int));
         cudaMalloc(&d_zbuffer, num_pixels * sizeof(double));
-        cudaMalloc(&d_colorbuffer, num_pixels * sizeof(uchar3));
+        cudaMalloc(&d_colorbuffer, num_pixels * sizeof(unsigned char) * 3);
         cudaMalloc(&d_tile_count, num_tiles * sizeof(int));
         cudaMalloc(&d_tile_start, num_tiles * sizeof(int));
 
@@ -348,11 +354,9 @@ int main(int argc, char** argv) {
                 init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
 
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
-                std::vector<RasterData> raster_data_host(model.nfaces());
+                tsc_counter tt0, tt1, tb0, tb1, rl0, rl1;
 
-                tsc_counter tt0, tt1;
                 RDTSC(tt0);
-
                 // Vertex Transform
                 cudaMemcpy(d_verts, model.verts.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_norms, model.norms.data(), model.norms.size() * sizeof(vec3), cudaMemcpyHostToDevice);
@@ -364,22 +368,16 @@ int main(int argc, char** argv) {
                 cudaMemcpyToSymbol(d_Viewport, &Viewport, sizeof(mat<4,4>));
                 cudaMemcpyToSymbol(d_Perspective, &Perspective, sizeof(mat<4,4>));
 
-                vertex_transform<<<256, 256>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
+                int nblocks_bin = (model.nfaces() + 255) / 256;
+                vertex_transform<<<nblocks_bin, 256>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
                 cudaDeviceSynchronize();
-                
-                // cudaMemcpy(raster_data_host.data(), d_raster_data, model.nfaces() * sizeof(RasterData), cudaMemcpyDeviceToHost);
                 RDTSC(tt1);
 
-                // std::stringstream raster_data_ss;
-                // raster_data_ss << dir_path << "/raster_data_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".txt";
-                // writeRasterData(raster_data_host, raster_data_ss.str().c_str());
 
                 // Binning
-                tsc_counter tb0, tb1;
                 RDTSC(tb0);
                 cudaMemset(d_tile_count, 0, num_tiles * sizeof(int));
 
-                int nblocks_bin = (model.nfaces() + 255) / 256;
                 binning_pass1<<<nblocks_bin, 256>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE);
                 
                 thrust::exclusive_scan(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles), thrust::device_ptr<int>(d_tile_start));
@@ -397,8 +395,8 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
                 RDTSC(tb1);
 
+
                 // Rasterization
-                tsc_counter rl0, rl1;
                 RDTSC(rl0);
                 init_raster_buffers<<<(num_pixels + 255) / 256, 256>>>(d_zbuffer, d_colorbuffer, num_pixels);
 
@@ -408,21 +406,8 @@ int main(int argc, char** argv) {
                 }
                 cudaDeviceSynchronize();
 
-                std::vector<uchar3> h_colorbuffer(num_pixels);
-                cudaMemcpy(h_colorbuffer.data(), d_colorbuffer, num_pixels * sizeof(uchar3), cudaMemcpyDeviceToHost);
+                cudaMemcpy(framebuffer.data.data(), d_colorbuffer, num_pixels * sizeof(unsigned char) * 3, cudaMemcpyDeviceToHost);
                 RDTSC(rl1);
-
-                tsc_counter rf0, rf1;
-                RDTSC(rf0);
-                for (int y = 0; y < img_size; ++y) {
-                    for (int x = 0; x < img_size; ++x) {
-                        const uchar3 &pix = h_colorbuffer[x + y * img_size];
-                        // framebuffer.set(x, y, TGAColor(pix.x, pix.y, pix.z, 255));
-                        // Explicitly cast to unsigned char to match the constructor exactly
-                        framebuffer.set(x, y, TGAColor{(unsigned char)pix.x, (unsigned char)pix.y, (unsigned char)pix.z, 255});
-                    }
-                }
-                RDTSC(rf1);
 
                 if (d_triangle_list) cudaFree(d_triangle_list);
 
@@ -430,8 +415,7 @@ int main(int argc, char** argv) {
                 long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
                 long long binning_cycles = COUNTER_DIFF(tb1, tb0, CYCLES);
                 long long raster_pure_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
-                long long reformat_cycles = COUNTER_DIFF(rf1, rf0, CYCLES);
-                long long total_cycles = transform_cycles + binning_cycles + raster_pure_cycles + reformat_cycles;
+                long long total_cycles = transform_cycles + binning_cycles + raster_pure_cycles;
 
                 csv_file << res << "," << eye.x << "_" << eye.y << "_" << eye.z << "," << light.x << "_" << light.y << "_" << light.z << "," << transform_cycles << "," << binning_cycles << "," << raster_pure_cycles << "," << reformat_cycles << "," << total_cycles << "\n";
                 csv_file.flush();
