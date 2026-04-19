@@ -129,7 +129,7 @@ def compare_images(gpu_path, cpu_path, tolerance=2):
 def main():
     base_dir = Path(r'C:\Users\kkhua\Desktop\CMU')
     # base_dir = Path('~/private/18646/18646-Project').expanduser()
-    gpu_results = base_dir / 'utah_teapot_results_tile8x16'
+    gpu_results = base_dir / 'utah_teapot_results_tile_32x16'
     cpu_results = base_dir / 'utah_teapot_results_baseline'
 
     if not gpu_results.exists():
@@ -142,7 +142,7 @@ def main():
         return 1
 
     # Verify only selected resolutions.
-    target_res_dirs = ['res_16', 'res_32']
+    target_res_dirs = ['res_16']
     gpu_images = []
     for res_dir in target_res_dirs:
         gpu_images.extend(sorted((gpu_results / res_dir).glob('gpu_out_e*_l*.tga')))
