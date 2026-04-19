@@ -1,69 +1,168 @@
+from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
-
-# 1. Load the data from your C++ output
-try:
-    df = pd.read_csv('results.csv')
-except FileNotFoundError:
-    print("Error: results.csv not found. Please run your C++ program first.")
-    exit()
-
-# 2. Calculate the average cycles for each phase per resolution
-averages = df.groupby('Resolution')[['All_Transform_Cycles', 'Raster_Loop_Cycles']].mean().reset_index()
-
-# 3. Create mapping for triangle counts for the X-axis
-tri_counts = {
-    16: "33,462",
-    32: "133,020",
-    64: "530,384",
-    128: "2,117,776"
-}
-x_labels = [f"{res}\n({tri_counts.get(res, '0')} triangles)" for res in averages['Resolution']]
-
-# ==========================================
-# PLOT 1: VERTEX TRANSFORM
-# ==========================================
-plt.figure(figsize=(10, 6))
-bars1 = plt.bar(x_labels, averages['All_Transform_Cycles'], color='#f39c12', edgecolor='black')
-
-plt.title('Average Execution Time: Vertex Transform', fontsize=15, fontweight='bold')
-plt.xlabel('Resolution Scale and Triangle Count', fontsize=12)
-plt.ylabel('Average CPU Cycles', fontsize=12)
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-# Add value labels
-for bar in bars1:
-    yval = bar.get_height()
-    plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.2e}', 
-             va='bottom', ha='center', fontsize=11, fontweight='bold')
-
-plt.tight_layout()
-plt.savefig('vertex_transform_result.png')
-print("Saved Vertex Transform plot to vertex_transform_result.png")
-plt.close() # Close the figure so it doesn't overlap with the next one
+import numpy as np
+from pandas.errors import EmptyDataError
 
 
-# ==========================================
-# PLOT 2: RASTERIZATION
-# ==========================================
-plt.figure(figsize=(10, 6))
-bars2 = plt.bar(x_labels, averages['Raster_Loop_Cycles'], color='#3498db', edgecolor='black')
+def load_all_results(pattern='results*.csv'):
+    csv_paths = sorted(Path('.').glob(pattern))
+    if not csv_paths:
+        raise FileNotFoundError(f"No files matched pattern: {pattern}")
 
-plt.title('Average Execution Time: Rasterization Loop', fontsize=15, fontweight='bold')
-plt.xlabel('Resolution Scale and Triangle Count', fontsize=12)
-plt.ylabel('Average CPU Cycles', fontsize=12)
-plt.grid(axis='y', linestyle='--', alpha=0.7)
+    data = []
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path)
+        except EmptyDataError:
+            print(f"Skipping {path.name}: file is empty")
+            continue
 
-# Add value labels
-for bar in bars2:
-    yval = bar.get_height()
-    plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.2e}', 
-             va='bottom', ha='center', fontsize=11, fontweight='bold')
+        if df.empty:
+            print(f"Skipping {path.name}: no rows")
+            continue
 
-plt.tight_layout()
-plt.savefig('rasterization_result.png')
-print("Saved Rasterization plot to rasterization_result.png")
-plt.close()
+        if 'Resolution' not in df.columns:
+            print(f"Skipping {path.name}: missing column ['Resolution']")
+            continue
 
-# If you want to display them interactively as well, you can remove the plt.close() 
-# commands and put plt.show() at the very end.
+        transform_candidates = [
+            'Transform_ms',
+            'All_Transform_ms',
+            'All_Transform_Cycles',
+        ]
+        raster_candidates = [
+            'Raster_ms',
+            'Raster_Loop_ms',
+            'Raster_Loop_Cycles',
+        ]
+        total_candidates = ['Total_ms']
+
+        transform_col = next((c for c in transform_candidates if c in df.columns), None)
+        raster_col = next((c for c in raster_candidates if c in df.columns), None)
+        total_col = next((c for c in total_candidates if c in df.columns), None)
+
+        if transform_col is None or raster_col is None or total_col is None:
+            print(
+                f"Skipping {path.name}: missing required metric columns "
+                f"(found: {list(df.columns)})"
+            )
+            continue
+
+        # Normalize metric names for downstream plotting.
+        df = df.rename(columns={
+            transform_col: 'Transform_Value',
+            raster_col: 'Raster_Value',
+            total_col: 'Total_Value',
+        })
+
+        averages = (
+            df.groupby('Resolution')[['Transform_Value', 'Raster_Value', 'Total_Value']]
+            .mean()
+            .reset_index()
+            .sort_values('Resolution')
+        )
+
+        label = path.stem.replace('results_', '')
+        if label == 'results':
+            label = 'default'
+
+        data.append((label, averages))
+
+    if not data:
+        raise ValueError('No valid CSV files with required columns were found.')
+
+    return data
+
+
+def build_x_labels(resolutions):
+    tri_counts = {
+        16: '33,462',
+        32: '133,020',
+        64: '530,384',
+        128: '2,117,776',
+    }
+    return [f"{res}\n({tri_counts.get(res, 'N/A')} triangles)" for res in resolutions]
+
+
+def plot_metric(all_data, metric_col, title, out_name, color_map='tab10'):
+    # Use union of all available resolutions so every file can be compared.
+    all_resolutions = sorted(
+        set().union(*[set(df['Resolution'].tolist()) for _, df in all_data])
+    )
+    x_labels = build_x_labels(all_resolutions)
+    x = np.arange(len(all_resolutions))
+
+    n_series = len(all_data)
+    width = 0.8 / max(1, n_series)
+
+    plt.figure(figsize=(12, 7))
+    cmap = plt.get_cmap(color_map)
+
+    for idx, (label, df) in enumerate(all_data):
+        value_map = dict(zip(df['Resolution'], df[metric_col]))
+        values = [value_map.get(r, np.nan) for r in all_resolutions]
+        offset = (idx - (n_series - 1) / 2) * width
+        bars = plt.bar(
+            x + offset,
+            values,
+            width=width,
+            label=label,
+            color=cmap(idx % 10),
+            edgecolor='black',
+            linewidth=0.7,
+        )
+
+        for bar, val in zip(bars, values):
+            if np.isnan(val):
+                continue
+            plt.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f'{val:.2e}',
+                va='bottom',
+                ha='center',
+                fontsize=8,
+                rotation=90,
+            )
+
+    plt.title(title, fontsize=15, fontweight='bold')
+    plt.xlabel('Resolution Scale and Triangle Count', fontsize=12)
+    plt.ylabel('Average Time (ms)', fontsize=12)
+    plt.xticks(x, x_labels)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.legend(title='Result File', fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_name, dpi=200)
+    print(f"Saved {title} plot to {out_name}")
+    plt.close()
+
+
+def main():
+    try:
+        all_data = load_all_results('results*.csv')
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        raise SystemExit(1)
+
+    print('Loaded result files:')
+    for label, df in all_data:
+        print(f"  - {label}: {len(df)} resolution point(s)")
+
+    plot_metric(
+        all_data,
+        metric_col='Transform_Value',
+        title='Average Execution Time: Vertex Transform (All CSVs)',
+        out_name='vertex_transform_all_results.png',
+    )
+
+    plot_metric(
+        all_data,
+        metric_col='Raster_Value',
+        title='Average Execution Time: Rasterization Loop (All CSVs)',
+        out_name='rasterization_all_results.png',
+    )
+
+
+if __name__ == '__main__':
+    main()

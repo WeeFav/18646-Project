@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
     vec3 up{0, 1, 0};
 
     for (int res : resolutions) {
-        std::string dir_path = base_name + "_results/res_" + std::to_string(res) + "/tile_" + tile_tag;
+        std::string dir_path = base_name + "_results_tile_" + tile_tag + "/res_" + std::to_string(res);
         fs::create_directories(dir_path);
 
         int img_size = res * 128;

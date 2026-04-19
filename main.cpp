@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
 
     // Results file for CPU baseline
     std::ofstream csv_file("results_baseline.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_ms,Raster_Loop_ms,Total_ms\n";
+    csv_file << "Resolution,Eye_Setting,Light_Setting,Transform_ms,Raster_ms,Total_ms\n";
 
     int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
