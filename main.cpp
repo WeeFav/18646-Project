@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
 
     // Results file for CPU baseline
     std::ofstream csv_file("results_baseline.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Raster_Loop_Cycles,Total_Cycles\n";
+    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_ms,Raster_Loop_ms,Total_ms\n";
 
     int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
@@ -147,18 +147,18 @@ int main(int argc, char** argv) {
                 }
                 RDTSC(rl1);
 
-                // Cycle calculation
-                long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
-                long long raster_loop_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
-                long long total_cycles = transform_cycles + raster_loop_cycles;
+                // Time calculation in milliseconds
+                double transform_ms = COUNTER_DIFF(tt1, tt0, CYCLES) * 1000.0 / PROCESSOR_FREQ;
+                double raster_loop_ms = COUNTER_DIFF(rl1, rl0, CYCLES) * 1000.0 / PROCESSOR_FREQ;
+                double total_ms = transform_ms + raster_loop_ms;
 
                 // Save metrics to CSV
                 csv_file << res << ","
                          << eye.x << "_" << eye.y << "_" << eye.z << ","
                          << light.x << "_" << light.y << "_" << light.z << ","
-                         << transform_cycles << ","
-                         << raster_loop_cycles << ","
-                         << total_cycles << "\n";
+                         << transform_ms << ","
+                         << raster_loop_ms << ","
+                         << total_ms << "\n";
                 csv_file.flush();
 
                 // Save TGA into the specific resolution baseline folder
@@ -168,9 +168,9 @@ int main(int argc, char** argv) {
 
                 std::cout << "[CONFIG] Res: " << res 
                           << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ")"
-                          << " | Transform: " << transform_cycles 
-                          << " | Raster: " << raster_loop_cycles 
-                          << " | Total: " << total_cycles << std::endl;
+                          << " | Transform(ms): " << transform_ms 
+                          << " | Raster(ms): " << raster_loop_ms 
+                          << " | Total(ms): " << total_ms << std::endl;
             }
         }
     }

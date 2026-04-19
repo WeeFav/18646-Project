@@ -13,11 +13,20 @@
 #include "model.h"
 #include "tgaimage.h"
 #include "geometry.h"
-#include "rdtsc.h"
 
 namespace fs = std::filesystem;
 
-#define TILE_SIZE 16
+#ifndef TILE_WIDTH
+#define TILE_WIDTH 16
+#endif
+
+#ifndef TILE_HEIGHT
+#define TILE_HEIGHT 16
+#endif
+
+#if TILE_WIDTH * TILE_HEIGHT > 1024
+#error "TILE_WIDTH * TILE_HEIGHT must be <= 1024"
+#endif
 
 // === Structs ===
 typedef vec4 Triangle[3];
@@ -128,7 +137,8 @@ __global__ void binning_pass1(
     int         nfaces,
     int         num_tiles_x,
     int         num_tiles_y,
-    int         tile_size
+    int         tile_width,
+    int         tile_height
 ) {
     // Each thread processes its triangles, atomicAdd to shared memory
     for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -151,10 +161,10 @@ __global__ void binning_pass1(
         double bbmaxy = fmax(s[0].y, fmax(s[1].y, s[2].y));
 
         // Tile range, clamped to valid tile indices
-        int tx_min = max(0,              (int)floor(bbminx / tile_size));
-        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_size));
-        int ty_min = max(0,              (int)floor(bbminy / tile_size));
-        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_size));
+        int tx_min = max(0,              (int)floor(bbminx / tile_width));
+        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_width));
+        int ty_min = max(0,              (int)floor(bbminy / tile_height));
+        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_height));
 
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++)
@@ -173,7 +183,8 @@ __global__ void binning_pass2(
     int         nfaces,
     int         num_tiles_x,
     int         num_tiles_y,
-    int         tile_size
+    int         tile_width,
+    int         tile_height
 ) {
     for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
          tri_id < nfaces;
@@ -191,10 +202,10 @@ __global__ void binning_pass2(
         double bbminy = fmin(s[0].y, fmin(s[1].y, s[2].y));
         double bbmaxy = fmax(s[0].y, fmax(s[1].y, s[2].y));
 
-        int tx_min = max(0,              (int)floor(bbminx / tile_size));
-        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_size));
-        int ty_min = max(0,              (int)floor(bbminy / tile_size));
-        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_size));
+        int tx_min = max(0,              (int)floor(bbminx / tile_width));
+        int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_width));
+        int ty_min = max(0,              (int)floor(bbminy / tile_height));
+        int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_height));
 
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++) {
@@ -223,7 +234,8 @@ __global__ void rasterize_tiled(
     const int        *d_tile_start,
     const int        *d_triangle_list,
     int               num_tiles_x,
-    int               tile_size,
+    int               tile_width,
+    int               tile_height,
     int               width,
     int               height,
     vec3              light_cam,
@@ -234,9 +246,9 @@ __global__ void rasterize_tiled(
     int ty = blockIdx.y;
     int tile_id = ty * num_tiles_x + tx;
 
-    int px = tx * tile_size + threadIdx.x;
-    int py = ty * tile_size + threadIdx.y;
-    if (threadIdx.x >= tile_size || threadIdx.y >= tile_size) return;
+    int px = tx * tile_width + threadIdx.x;
+    int py = ty * tile_height + threadIdx.y;
+    if (threadIdx.x >= tile_width || threadIdx.y >= tile_height) return;
     if (px >= width || py >= height) return;
 
     int pix_id = px + py * width;
@@ -301,17 +313,18 @@ int main(int argc, char** argv) {
         base_name = base_name.substr(0, base_name.size() - 4);
     }
 
-    std::ofstream csv_file("results.csv");
-    csv_file << "Resolution,Eye_Setting,Light_Setting,All_Transform_Cycles,Binning_Cycles,Raster_Pure_Cycles,Reformat_Cycles,Total_Cycles\n";
+    std::string tile_tag = std::to_string(TILE_WIDTH) + "x" + std::to_string(TILE_HEIGHT);
+    std::ofstream csv_file("results_" + tile_tag + ".csv");
+    csv_file << "Resolution,Eye_Setting,Light_Setting,Transform_ms,Binning_ms,Raster_ms,Total_ms\n";
 
-    int resolutions[] = {16, 32, 64, 128};
+    int resolutions[] = {16,32,64,128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
     vec3 light_settings[] = {{0, 1, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}};
     vec3 center{0.065, 0.4725, 0};
     vec3 up{0, 1, 0};
 
     for (int res : resolutions) {
-        std::string dir_path = base_name + "_results/res_" + std::to_string(res);
+        std::string dir_path = base_name + "_results/res_" + std::to_string(res) + "/tile_" + tile_tag;
         fs::create_directories(dir_path);
 
         int img_size = res * 128;
@@ -333,8 +346,8 @@ int main(int argc, char** argv) {
         int *d_tile_count, *d_tile_start;
 
         int num_pixels = img_size * img_size;
-        int num_tiles_x = img_size / TILE_SIZE;
-        int num_tiles_y = img_size / TILE_SIZE;
+        int num_tiles_x = (img_size + TILE_WIDTH - 1) / TILE_WIDTH;
+        int num_tiles_y = (img_size + TILE_HEIGHT - 1) / TILE_HEIGHT;
         int num_tiles   = num_tiles_x * num_tiles_y;
 
         cudaMalloc(&d_raster_data, model.nfaces() * sizeof(RasterData));
@@ -354,9 +367,12 @@ int main(int argc, char** argv) {
                 init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
 
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
-                tsc_counter tt0, tt1, tb0, tb1, rl0, rl1;
+                cudaEvent_t ev_tt0, ev_tt1, ev_tb0, ev_tb1, ev_rl0, ev_rl1;
+                cudaEventCreate(&ev_tt0); cudaEventCreate(&ev_tt1);
+                cudaEventCreate(&ev_tb0); cudaEventCreate(&ev_tb1);
+                cudaEventCreate(&ev_rl0); cudaEventCreate(&ev_rl1);
 
-                RDTSC(tt0);
+                cudaEventRecord(ev_tt0);
                 // Vertex Transform
                 cudaMemcpy(d_verts, model.verts.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_norms, model.norms.data(), model.norms.size() * sizeof(vec3), cudaMemcpyHostToDevice);
@@ -370,15 +386,15 @@ int main(int argc, char** argv) {
 
                 int nblocks_bin = (model.nfaces() + 255) / 256;
                 vertex_transform<<<nblocks_bin, 256>>>(d_verts, d_norms, d_facet_vrt, d_facet_nrm, d_raster_data, model.nverts(), model.nfaces());
-                cudaDeviceSynchronize();
-                RDTSC(tt1);
+                cudaEventRecord(ev_tt1);
+                cudaEventSynchronize(ev_tt1);
 
 
                 // Binning
-                RDTSC(tb0);
+                cudaEventRecord(ev_tb0);
                 cudaMemset(d_tile_count, 0, num_tiles * sizeof(int));
 
-                binning_pass1<<<nblocks_bin, 256>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE);
+                binning_pass1<<<nblocks_bin, 256>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_WIDTH, TILE_HEIGHT);
                 
                 thrust::exclusive_scan(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles), thrust::device_ptr<int>(d_tile_start));
                 int total_overlaps = thrust::reduce(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles));
@@ -389,42 +405,46 @@ int main(int argc, char** argv) {
                     int *d_tile_cursor;
                     cudaMalloc(&d_tile_cursor, num_tiles * sizeof(int));
                     cudaMemcpy(d_tile_cursor, d_tile_start, num_tiles * sizeof(int), cudaMemcpyDeviceToDevice);
-                    binning_pass2<<<nblocks_bin, 256>>>(d_raster_data, d_tile_cursor, d_triangle_list, model.nfaces(), num_tiles_x, num_tiles_y, TILE_SIZE);
+                    binning_pass2<<<nblocks_bin, 256>>>(d_raster_data, d_tile_cursor, d_triangle_list, model.nfaces(), num_tiles_x, num_tiles_y, TILE_WIDTH, TILE_HEIGHT);
                     cudaFree(d_tile_cursor);
                 }
-                cudaDeviceSynchronize();
-                RDTSC(tb1);
+                cudaEventRecord(ev_tb1);
+                cudaEventSynchronize(ev_tb1);
 
 
                 // Rasterization
-                RDTSC(rl0);
+                cudaEventRecord(ev_rl0);
                 init_raster_buffers<<<(num_pixels + 255) / 256, 256>>>(d_zbuffer, d_colorbuffer, num_pixels);
 
                 if (total_overlaps > 0) {
                     vec3 light_cam = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
-                    rasterize_tiled<<<dim3(num_tiles_x, num_tiles_y), dim3(TILE_SIZE, TILE_SIZE)>>>(d_raster_data, d_tile_count, d_tile_start, d_triangle_list, num_tiles_x, TILE_SIZE, img_size, img_size, light_cam, d_zbuffer, d_colorbuffer);
+                    rasterize_tiled<<<dim3(num_tiles_x, num_tiles_y), dim3(TILE_WIDTH, TILE_HEIGHT)>>>(d_raster_data, d_tile_count, d_tile_start, d_triangle_list, num_tiles_x, TILE_WIDTH, TILE_HEIGHT, img_size, img_size, light_cam, d_zbuffer, d_colorbuffer);
                 }
-                cudaDeviceSynchronize();
-
                 cudaMemcpy(framebuffer.data.data(), d_colorbuffer, num_pixels * sizeof(unsigned char) * 3, cudaMemcpyDeviceToHost);
-                RDTSC(rl1);
+                cudaEventRecord(ev_rl1);
+                cudaEventSynchronize(ev_rl1);
 
                 if (d_triangle_list) cudaFree(d_triangle_list);
 
                 // logging
-                long long transform_cycles = COUNTER_DIFF(tt1, tt0, CYCLES);
-                long long binning_cycles = COUNTER_DIFF(tb1, tb0, CYCLES);
-                long long raster_pure_cycles = COUNTER_DIFF(rl1, rl0, CYCLES);
-                long long total_cycles = transform_cycles + binning_cycles + raster_pure_cycles;
+                float transform_ms = 0.0f, binning_ms = 0.0f, raster_ms = 0.0f;
+                cudaEventElapsedTime(&transform_ms, ev_tt0, ev_tt1);
+                cudaEventElapsedTime(&binning_ms, ev_tb0, ev_tb1);
+                cudaEventElapsedTime(&raster_ms, ev_rl0, ev_rl1);
+                float total_ms = transform_ms + binning_ms + raster_ms;
 
-                csv_file << res << "," << eye.x << "_" << eye.y << "_" << eye.z << "," << light.x << "_" << light.y << "_" << light.z << "," << transform_cycles << "," << binning_cycles << "," << raster_pure_cycles << "," << reformat_cycles << "," << total_cycles << "\n";
+                csv_file << res << "," << eye.x << "_" << eye.y << "_" << eye.z << "," << light.x << "_" << light.y << "_" << light.z << "," << transform_ms << "," << binning_ms << "," << raster_ms << "," << total_ms << "\n";
                 csv_file.flush();
 
                 std::stringstream tga_ss;
                 tga_ss << dir_path << "/gpu_out_e" << (int)eye.x << (int)eye.y << (int)eye.z << "_l" << (int)light.x << (int)light.y << (int)light.z << ".tga";
                 framebuffer.write_tga_file(tga_ss.str().c_str());
 
-                std::cout << "[CONFIG] Res: " << res << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ") | Transform: " << transform_cycles << " | Binning: " << binning_cycles << " | Raster: " << raster_pure_cycles << " | Reformat: " << reformat_cycles << " | Total: " << total_cycles << std::endl;
+                std::cout << "[CONFIG] Res: " << res << " | Eye: (" << eye.x << ", " << eye.y << ", " << eye.z << ") | Transform(ms): " << transform_ms << " | Binning(ms): " << binning_ms << " | Raster(ms): " << raster_ms << " | Total(ms): " << total_ms << std::endl;
+
+                cudaEventDestroy(ev_tt0); cudaEventDestroy(ev_tt1);
+                cudaEventDestroy(ev_tb0); cudaEventDestroy(ev_tb1);
+                cudaEventDestroy(ev_rl0); cudaEventDestroy(ev_rl1);
             }
         }
         // cleanup per resolution
