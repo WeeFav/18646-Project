@@ -2,6 +2,7 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import re
 from pandas.errors import EmptyDataError
 
 
@@ -138,6 +139,43 @@ def plot_metric(all_data, metric_col, title, out_name, color_map='tab10'):
     plt.close()
 
 
+def tile_sort_key(tile_label):
+    match = re.fullmatch(r'(\d+)x(\d+)', str(tile_label))
+    if match:
+        return (0, int(match.group(1)), int(match.group(2)))
+    return (1, str(tile_label))
+
+
+def print_metric_table(all_data, metric_col, table_title):
+    rows = []
+    for label, df in all_data:
+        for _, row in df.iterrows():
+            rows.append({
+                'Tile_Size': label,
+                'Resolution': int(row['Resolution']),
+                'Value': row[metric_col],
+            })
+
+    table_df = pd.DataFrame(rows)
+    if table_df.empty:
+        print(f"\n{table_title}\nNo data available.")
+        return
+
+    pivot = (
+        table_df.pivot_table(
+            index='Tile_Size',
+            columns='Resolution',
+            values='Value',
+            aggfunc='mean',
+        )
+        .sort_index(key=lambda idx: [tile_sort_key(v) for v in idx])
+        .sort_index(axis=1)
+    )
+
+    print(f"\n{table_title}")
+    print(pivot.to_string(float_format=lambda x: f"{x:.4e}"))
+
+
 def main():
     try:
         all_data = load_all_results('results*.csv')
@@ -149,17 +187,29 @@ def main():
     for label, df in all_data:
         print(f"  - {label}: {len(df)} resolution point(s)")
 
+    print_metric_table(
+        all_data,
+        metric_col='Transform_Value',
+        table_title='Vertex Transform Table (rows=tile size, columns=resolution)',
+    )
+
+    print_metric_table(
+        all_data,
+        metric_col='Raster_Value',
+        table_title='Rasterization Table (rows=tile size, columns=resolution)',
+    )
+
     plot_metric(
         all_data,
         metric_col='Transform_Value',
-        title='Average Execution Time: Vertex Transform (All CSVs)',
+        title='Average Execution Time: Vertex Transform',
         out_name='vertex_transform_all_results.png',
     )
 
     plot_metric(
         all_data,
         metric_col='Raster_Value',
-        title='Average Execution Time: Rasterization Loop (All CSVs)',
+        title='Average Execution Time: Rasterization',
         out_name='rasterization_all_results.png',
     )
 
