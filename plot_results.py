@@ -7,6 +7,7 @@ from pandas.errors import EmptyDataError
 
 
 def load_all_results(pattern='results*.csv'):
+    """Load, validate, and average benchmark CSV data grouped by resolution."""
     csv_paths = sorted(Path('.').glob(pattern))
     if not csv_paths:
         raise FileNotFoundError(f"No files matched pattern: {pattern}")
@@ -77,6 +78,7 @@ def load_all_results(pattern='results*.csv'):
 
 
 def build_x_labels(resolutions):
+    """Build plot x-axis labels using resolution and known triangle counts."""
     tri_counts = {
         16: '33,462',
         32: '133,020',
@@ -87,6 +89,7 @@ def build_x_labels(resolutions):
 
 
 def plot_metric(all_data, metric_col, title, out_name, color_map='tab10'):
+    """Render and save a grouped bar chart for a selected metric across tile sizes."""
     # Use union of all available resolutions so every file can be compared.
     all_resolutions = sorted(
         set().union(*[set(df['Resolution'].tolist()) for _, df in all_data])
@@ -140,6 +143,7 @@ def plot_metric(all_data, metric_col, title, out_name, color_map='tab10'):
 
 
 def tile_sort_key(tile_label):
+    """Return a sort key that orders NxM tile labels numerically before text labels."""
     match = re.fullmatch(r'(\d+)x(\d+)', str(tile_label))
     if match:
         return (0, int(match.group(1)), int(match.group(2)))
@@ -147,6 +151,7 @@ def tile_sort_key(tile_label):
 
 
 def print_metric_table(all_data, metric_col, table_title):
+    """Print a pivot table with tile size as rows and resolution as columns."""
     rows = []
     for label, df in all_data:
         for _, row in df.iterrows():
@@ -177,6 +182,7 @@ def print_metric_table(all_data, metric_col, table_title):
 
 
 def main():
+    """Run the full result-processing pipeline and generate tables and plots."""
     try:
         all_data = load_all_results('results*.csv')
     except (FileNotFoundError, ValueError) as e:
