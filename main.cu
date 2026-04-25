@@ -25,8 +25,7 @@ struct RasterData {
 };
 
 // === Global Variables ===
-mat<4,4> ModelView, ModelViewInv, Viewport, Perspective; // "OpenGL" state matrices
-std::vector<double> zbuffer;               // depth buffer
+mat<4,4> ModelView, ModelViewInv, Viewport, Perspective;
 
 // === GPU Constant ===
 __constant__ mat<4,4> d_ModelView, d_ModelViewInv, d_Viewport, d_Perspective;
@@ -47,10 +46,6 @@ void init_perspective(const double f) {
 
 void init_viewport(const int x, const int y, const int w, const int h) {
     Viewport = {{{w/2., 0, 0, x+w/2.}, {0, h/2., 0, y+h/2.}, {0,0,1,0}, {0,0,0,1}}};
-}
-
-void init_zbuffer(const int width, const int height) {
-    zbuffer = std::vector(width*height, -1000.);
 }
 
 void writeRasterData(const std::vector<RasterData>& data, const std::string& filename) {
@@ -89,9 +84,11 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
 __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt, int *d_facet_nrm, RasterData *d_raster_data, int nverts, int nfaces) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // calculate number of iterations each thread needs    
     int iterations = nfaces / (gridDim.x * blockDim.x);
     int remainder = nfaces % (gridDim.x * blockDim.x);
     
+    // determine which face should the thread start at
     int start;
     if (id < remainder) {
         start = (iterations + 1) * id;
@@ -100,8 +97,10 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
         start = (iterations * id) + remainder;
     }
 
+    // loop over assigned face
     for (int face_idx = start; face_idx < start + iterations + (id < remainder); face_idx++) {
         Triangle clip;
+        // loop over each vertex
         for (int nthvert = 0; nthvert < 3; nthvert++) {
             vec3 v = d_verts[d_facet_vrt[face_idx * 3 + nthvert]];
             vec3 n = d_norms[d_facet_nrm[face_idx * 3 + nthvert]];
@@ -128,7 +127,7 @@ __global__ void binning_pass1(
     int         tile_width,
     int         tile_height
 ) {
-    // Each thread processes its triangles, atomicAdd to shared memory
+    // Each thread processes its triangles, atomicAdd to global memory
     for (int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
          tri_id < nfaces;
          tri_id += gridDim.x * blockDim.x)
@@ -154,6 +153,7 @@ __global__ void binning_pass1(
         int ty_min = max(0,              (int)floor(bbminy / tile_height));
         int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_height));
 
+        // for each tile the triangle overlaps, increment the count
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++)
                 atomicAdd(&d_tile_count[ty * num_tiles_x + tx], 1);
@@ -185,16 +185,19 @@ __global__ void binning_pass2(
                    + s[2].x * (s[0].y - s[1].y);
         if (det < 1.0) continue;
 
+        // Screen-space bounding box
         double bbminx = fmin(s[0].x, fmin(s[1].x, s[2].x));
         double bbmaxx = fmax(s[0].x, fmax(s[1].x, s[2].x));
         double bbminy = fmin(s[0].y, fmin(s[1].y, s[2].y));
         double bbmaxy = fmax(s[0].y, fmax(s[1].y, s[2].y));
 
+        // Tile range, clamped to valid tile indices
         int tx_min = max(0,              (int)floor(bbminx / tile_width));
         int tx_max = min(num_tiles_x - 1,(int)floor(bbmaxx / tile_width));
         int ty_min = max(0,              (int)floor(bbminy / tile_height));
         int ty_max = min(num_tiles_y - 1,(int)floor(bbmaxy / tile_height));
 
+        // for each tile the triangle overlaps, find the index of the triangl list and assign the triangle id
         for (int ty = ty_min; ty <= ty_max; ty++)
             for (int tx = tx_min; tx <= tx_max; tx++) {
                 int pos = atomicAdd(&d_tile_cursor[ty * num_tiles_x + tx], 1);
@@ -203,6 +206,7 @@ __global__ void binning_pass2(
     }
 }
 
+// initalize the depth and color buffer on GPU
 __global__ void init_raster_buffers(double *d_zbuffer, unsigned char *d_colorbuffer, int npixels) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < npixels;
@@ -239,10 +243,11 @@ __global__ void rasterize_tiled(
     if (threadIdx.x >= tile_width || threadIdx.y >= tile_height) return;
     if (px >= width || py >= height) return;
 
+    // global pixel id
     int pix_id = px + py * width;
     double best_z = d_zbuffer[pix_id];
     unsigned char best_color[3] = {d_colorbuffer[pix_id * 3 + 0], d_colorbuffer[pix_id * 3 + 1], d_colorbuffer[pix_id * 3 + 2]};
-
+    
     int tri_count = d_tile_count[tile_id];
     int tri_begin = d_tile_start[tile_id];
 
