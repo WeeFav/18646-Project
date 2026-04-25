@@ -1,3 +1,15 @@
+/**
+ * @file main.cu
+ * @brief GPU-parallelized tiled rasterizer using CUDA
+ *
+ * The pipeline has three GPU passes:
+ *   1. vertex_transform  — one thread per face, world → clip → NDC → screen
+ *   2. binning (pass1 + pass2) — build a per-tile triangle list via prefix sum
+ *   3. rasterize_tiled   — one CUDA block per tile, one thread per pixel
+ *
+ * The outer loop sweeps tile sizes, resolutions, camera positions, and light
+ * directions, recording per-pass timings to per-tile-size CSVs.
+ */
 #include <iostream>
 #include <vector>
 #include <string>
@@ -16,7 +28,7 @@
 
 namespace fs = std::filesystem;
 
-// === Structs ===
+// Structs
 typedef vec4 Triangle[3];
 struct RasterData {
     vec4 ndc[3];
@@ -24,13 +36,17 @@ struct RasterData {
     vec3 varying_nrm[3];
 };
 
-// === Global Variables ===
+// Global Variables
 mat<4,4> ModelView, ModelViewInv, Viewport, Perspective;
 
-// === GPU Constant ===
+// GPU Constant
 __constant__ mat<4,4> d_ModelView, d_ModelViewInv, d_Viewport, d_Perspective;
 
-// === Helper functions ====
+// Helper functions
+/**
+ * @brief Builds the ModelView matrix from eye/center/up and precomputes its
+ * inverse-transpose for normal transformation.
+ */
 void lookat(const vec3 eye, const vec3 center, const vec3 up) {
     vec3 n = normalized(eye-center);
     vec3 l = normalized(cross(up,n));
@@ -40,14 +56,20 @@ void lookat(const vec3 eye, const vec3 center, const vec3 up) {
     ModelViewInv = ModelView.invert_transpose();
 }
 
+/** @brief Sets up a simple perspective matrix with focal length f. */
 void init_perspective(const double f) {
     Perspective = {{{1,0,0,0}, {0,1,0,0}, {0,0,1,0}, {0,0, -1/f,1}}};
 }
 
+/** @brief Builds the NDC-to-screen viewport transform for a (x,y,w,h) region. */
 void init_viewport(const int x, const int y, const int w, const int h) {
     Viewport = {{{w/2., 0, 0, x+w/2.}, {0, h/2., 0, y+h/2.}, {0,0,1,0}, {0,0,0,1}}};
 }
 
+/**
+ * @brief Serializes raster data for all triangles to a text file for debugging.
+ * Each vertex is written as: header line, NDC (x y z w), screen (x y), normal (x y z).
+ */
 void writeRasterData(const std::vector<RasterData>& data, const std::string& filename) {
     std::ofstream out(filename);
     if (!out) {
@@ -79,28 +101,30 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
     }
 }
 
-// === GPU Kernels ===
-
+// GPU Kernels
+/**
+ * @brief Vertex transform kernel - maps each mesh face from world space to
+ * screen space and stores the results in d_raster_data.
+ *
+ * Faces are divided evenly across threads using a static block distribution;
+ * the first `remainder` threads each get one extra face so no face is skipped.
+ */
 __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt, int *d_facet_nrm, RasterData *d_raster_data, int nverts, int nfaces) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // calculate number of iterations each thread needs    
+    // Divide faces as evenly as possible; first `remainder` threads take one extra
     int iterations = nfaces / (gridDim.x * blockDim.x);
-    int remainder = nfaces % (gridDim.x * blockDim.x);
-    
-    // determine which face should the thread start at
+    int remainder  = nfaces % (gridDim.x * blockDim.x);
+
     int start;
     if (id < remainder) {
         start = (iterations + 1) * id;
-    }
-    else {
+    } else {
         start = (iterations * id) + remainder;
     }
 
-    // loop over assigned face
     for (int face_idx = start; face_idx < start + iterations + (id < remainder); face_idx++) {
         Triangle clip;
-        // loop over each vertex
         for (int nthvert = 0; nthvert < 3; nthvert++) {
             vec3 v = d_verts[d_facet_vrt[face_idx * 3 + nthvert]];
             vec3 n = d_norms[d_facet_nrm[face_idx * 3 + nthvert]];
@@ -115,9 +139,11 @@ __global__ void vertex_transform(vec3 *d_verts, vec3 *d_norms, int *d_facet_vrt,
     }
 }
 
-// Binning Pass 1: count how many triangles overlap each tile.
-// One thread per triangle. Mirrors the ABC.det() < 1 cull from the CPU rasterizer
-// (mat::det() is not __device__, so we compute the 3x3 determinant inline).
+/**
+ * @brief Binning pass 1: count how many triangles overlap each tile.
+ * One thread per triangle. 
+ * Uses atomicAdd so concurrent threads don't race on shared tile counters.
+ */
 __global__ void binning_pass1(
     RasterData *d_raster_data,
     int        *d_tile_count,
@@ -135,7 +161,7 @@ __global__ void binning_pass1(
         const vec2 *s = d_raster_data[tri_id].screen;
 
         // Signed-area det of ABC (same formula as our_gl.cpp: ABC.det() < 1)
-        // Rows of ABC are {s[i].x, s[i].y, 1}; expanding the 3x3 determinant:
+        // Rows of ABC are {s[i].x, s[i].y, 1}; expanding the 3x3 determinant
         double det = s[0].x * (s[1].y - s[2].y)
                    + s[1].x * (s[2].y - s[0].y)
                    + s[2].x * (s[0].y - s[1].y);
@@ -160,10 +186,12 @@ __global__ void binning_pass1(
     }
 }
 
-// Binning Pass 2: scatter triangle IDs into the flat triangle_list.
-// d_tile_cursor is a mutable copy of d_tile_start; atomicAdd on it gives each
-// thread a unique slot without overwriting d_tile_start (which the rasterization
-// kernel reads to locate each tile's list).
+/**
+ * @brief Binning pass 2: scatter triangle IDs into the flat triangle_list.
+ * d_tile_cursor is a mutable copy of d_tile_start; atomicAdd gives each thread
+ * a unique write slot without corrupting d_tile_start, which the rasterizer
+ * still needs to locate each tile's sublist.
+ */
 __global__ void binning_pass2(
     RasterData *d_raster_data,
     int        *d_tile_cursor,
@@ -206,7 +234,10 @@ __global__ void binning_pass2(
     }
 }
 
-// initalize the depth and color buffer on GPU
+/**
+ * @brief Initializes the depth buffer to -1000 and the color buffer to black
+ * on the GPU before each rasterization pass.
+ */
 __global__ void init_raster_buffers(double *d_zbuffer, unsigned char *d_colorbuffer, int npixels) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < npixels;
@@ -219,7 +250,14 @@ __global__ void init_raster_buffers(double *d_zbuffer, unsigned char *d_colorbuf
     }
 }
 
-// One block rasterizes one tile; each thread handles one pixel in that tile.
+/**
+ * @brief Tiled rasterization kernel - one CUDA block per tile, one thread per pixel.
+ *
+ * Each thread walks the triangle list for its tile, computes barycentric
+ * coordinates, performs a depth test, and evaluates Phong shading
+ * (ambient + diffuse + specular) for the closest visible triangle.
+ * Results are written directly to d_zbuffer and d_colorbuffer.
+ */
 __global__ void rasterize_tiled(
     const RasterData *d_raster_data,
     const int        *d_tile_count,
@@ -294,7 +332,11 @@ __global__ void rasterize_tiled(
     d_colorbuffer[pix_id * 3 + 2] = best_color[2];
 }
 
-// === Main ===
+/**
+ * @brief Entry point, sweeps all tile sizes × resolutions × camera/light configs.
+ * For each combination, runs the three-pass GPU pipeline 10 times and records
+ * per-pass timings to a per-tile-size CSV file.
+ */
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " base_name" << std::endl;
@@ -338,7 +380,6 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // ALLOCATION HERE: Once per resolution to prevent leaks/noise
             RasterData *d_raster_data;
             vec3 *d_verts, *d_norms;
             int *d_facet_vrt, *d_facet_nrm;
@@ -363,9 +404,11 @@ int main(int argc, char** argv) {
 
             for (vec3 eye : eye_settings) {
                 for (vec3 light : light_settings) {
+                    // Run each config 10 times to get stable timing averages
                     for (int k=0; k<10; k++) {
                         lookat(eye, center, up);
                         init_perspective(norm(eye - center));
+                        // Viewport inset: 1/16 border, 7/8 of image used
                         init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
 
                         TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
@@ -374,8 +417,9 @@ int main(int argc, char** argv) {
                         cudaEventCreate(&ev_tb0); cudaEventCreate(&ev_tb1);
                         cudaEventCreate(&ev_rl0); cudaEventCreate(&ev_rl1);
 
+                        // Pass 1: vertex transform
                         cudaEventRecord(ev_tt0);
-                        // Vertex Transform
+                        // Upload geometry and matrix constants each iteration
                         cudaMemcpy(d_verts, model.verts.data(), model.nverts() * sizeof(vec3), cudaMemcpyHostToDevice);
                         cudaMemcpy(d_norms, model.norms.data(), model.norms.size() * sizeof(vec3), cudaMemcpyHostToDevice);
                         cudaMemcpy(d_facet_vrt, model.facet_vrt.data(), model.nfaces() * 3 * sizeof(int), cudaMemcpyHostToDevice);
@@ -391,19 +435,20 @@ int main(int argc, char** argv) {
                         cudaEventRecord(ev_tt1);
                         cudaEventSynchronize(ev_tt1);
 
-
-                        // Binning
+                        // Pass 2: binning
                         cudaEventRecord(ev_tb0);
                         cudaMemset(d_tile_count, 0, num_tiles * sizeof(int));
 
                         binning_pass1<<<nblocks_bin, 256>>>(d_raster_data, d_tile_count, model.nfaces(), num_tiles_x, num_tiles_y, TILE_WIDTH, TILE_HEIGHT);
-                        
+
+                        // Prefix sum over tile counts → tile start offsets; then sum total for allocation
                         thrust::exclusive_scan(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles), thrust::device_ptr<int>(d_tile_start));
                         int total_overlaps = thrust::reduce(thrust::device_ptr<int>(d_tile_count), thrust::device_ptr<int>(d_tile_count + num_tiles));
 
                         int *d_triangle_list = nullptr;
                         if (total_overlaps > 0) {
                             cudaMalloc(&d_triangle_list, total_overlaps * sizeof(int));
+                            // d_tile_cursor is a scratch copy of d_tile_start consumed by pass2
                             int *d_tile_cursor;
                             cudaMalloc(&d_tile_cursor, num_tiles * sizeof(int));
                             cudaMemcpy(d_tile_cursor, d_tile_start, num_tiles * sizeof(int), cudaMemcpyDeviceToDevice);
@@ -413,12 +458,12 @@ int main(int argc, char** argv) {
                         cudaEventRecord(ev_tb1);
                         cudaEventSynchronize(ev_tb1);
 
-
-                        // Rasterization
+                        // Pass 3: rasterization
                         cudaEventRecord(ev_rl0);
                         init_raster_buffers<<<(num_pixels + 255) / 256, 256>>>(d_zbuffer, d_colorbuffer, num_pixels);
 
                         if (total_overlaps > 0) {
+                            // Transform light direction into camera space once per config
                             vec3 light_cam = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
                             rasterize_tiled<<<dim3(num_tiles_x, num_tiles_y), dim3(TILE_WIDTH, TILE_HEIGHT)>>>(d_raster_data, d_tile_count, d_tile_start, d_triangle_list, num_tiles_x, TILE_WIDTH, TILE_HEIGHT, img_size, img_size, light_cam, d_zbuffer, d_colorbuffer);
                         }

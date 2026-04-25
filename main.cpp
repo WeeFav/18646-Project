@@ -1,9 +1,18 @@
+/**
+ * @file main.cpp
+ * @brief CPU baseline rasterizer
+ *
+ * Iterates over multiple mesh resolutions, camera positions, and light
+ * directions. For each configuration it times the vertex-transform
+ * and rasterization passes separately and records the results to a CSV file.
+ * Output TGA images are written to per-resolution subdirectories.
+ */
 #include <iostream>
 #include <vector>
 #include <string>
 #include <sstream>
 #include <fstream>
-#include <filesystem> // Required for directory creation
+#include <filesystem>
 #include <algorithm>
 #include "our_gl.h"
 #include "model.h"
@@ -14,6 +23,10 @@ namespace fs = std::filesystem;
 extern mat<4, 4> ModelView, Perspective;
 extern std::vector<double> zbuffer;
 
+/**
+ * @brief Serializes raster data for all triangles to a text file for debugging.
+ * Each vertex is written as: header line, NDC (x y z w), screen (x y), normal (x y z).
+ */
 void writeRasterData(const std::vector<RasterData>& data, const std::string& filename) {
     std::ofstream out(filename);
     if (!out) {
@@ -45,15 +58,23 @@ void writeRasterData(const std::vector<RasterData>& data, const std::string& fil
     }
 }
 
+/**
+ * @brief Phong shading pipeline - transforms vertices and computes per-pixel
+ * ambient + diffuse + specular lighting in camera space.
+ */
 struct PhongShader : IShader {
     const Model &model;
-    vec3 l;
-    vec3 tri[3];
+    vec3 l;       // light direction in camera space
+    vec3 tri[3];  // camera-space vertex positions
 
     PhongShader(const vec3 light, const Model &m) : model(m) {
         l = normalized((ModelView * vec4{light.x, light.y, light.z, 0.}).xyz());
     }
 
+    /**
+     * transforms a mesh vertex into clip space and records the
+     * interpolated normal for the fragment stage.
+     */
     virtual vec4 vertex(const int face, const int vert, vec3 &varying_nrm) {
         vec3 v = model.vert(face, vert);
         vec3 n = model.normal(face, vert);
@@ -63,6 +84,10 @@ struct PhongShader : IShader {
         return Perspective * gl_Position;
     }
 
+    /**
+     * evaluates Phong shading at a fragment given barycentric coords.
+     * Interpolates the surface normal, then computes ambient + diffuse + specular.
+     */
     virtual std::pair<bool, TGAColor> fragment(const vec3 bar, const vec3 (&varying_nrm)[3]) const {
         TGAColor gl_FragColor = {255, 255, 255, 255};
         vec3 n = normalized(varying_nrm[0] * bar[0] + varying_nrm[1] * bar[1] + varying_nrm[2] * bar[2]);
@@ -76,6 +101,10 @@ struct PhongShader : IShader {
     }
 };
 
+/**
+ * @brief Entry point - runs the CPU baseline over all (resolution, eye, light)
+ * combinations, timing each pass with RDTSC and writing results to CSV.
+ */
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " base_name" << std::endl;
@@ -91,6 +120,7 @@ int main(int argc, char** argv) {
     std::ofstream csv_file("results_baseline.csv");
     csv_file << "Resolution,Eye_Setting,Light_Setting,Transform_ms,Raster_ms,Total_ms\n";
 
+    // img_size = res * 128, so resolutions {16..128} give {2048..16384} images
     int resolutions[] = {16, 32, 64, 128};
     vec3 eye_settings[] = {{0, 1, 3}, {-3, 1, 0}, {3, 1, 0}, {0, 4, 0}, {2, 2, 2}};
     vec3 light_settings[] = {{0, 1, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}};
@@ -103,33 +133,35 @@ int main(int argc, char** argv) {
         fs::create_directories(dir_path);
 
         int img_size = res * 128;
-        
-        // Load the decimated model corresponding to this resolution
+
+        // Load the model corresponding to this resolution
         std::stringstream obj_ss;
         obj_ss << base_name << "_" << res << ".obj";
 
         Model model(obj_ss.str().c_str());
         if (model.nfaces() == 0) {
-            std::cerr << "Model " << obj_ss.str() << " not found. Skipping resolution " << res << std::endl;
+            std::cerr << "Model " << obj_ss.str() << " not found - Skipping resolution " << res << std::endl;
             continue;
         }
 
         for (vec3 eye : eye_settings) {
             for (vec3 light : light_settings) {
-                // Initialize scene state
+                // Set up camera, projection, viewport, and depth buffer for this config
                 lookat(eye, center, up);
                 init_perspective(norm(eye - center));
+                // Viewport inset: 1/16 border on each side, 7/8 of image used
                 init_viewport(img_size / 16, img_size / 16, img_size * 7 / 8, img_size * 7 / 8);
                 init_zbuffer(img_size, img_size);
-                
+
                 TGAImage framebuffer(img_size, img_size, TGAImage::RGB);
                 PhongShader shader(light, model);
                 std::vector<RasterData> raster_data(model.nfaces());
 
+                // Timed pass 1: vertex transform
                 tsc_counter tt0, tt1;
                 RDTSC(tt0);
 
-                // --- Vertex Transform / Prepare Raster Data ---
+                // Transform each face's vertices to clip space, compute NDC/screen coords
                 for (int f = 0; f < model.nfaces(); f++) {
                     Triangle clip;
                     for (int v = 0; v < 3; v++) {
@@ -139,7 +171,7 @@ int main(int argc, char** argv) {
                 }
                 RDTSC(tt1);
 
-                // --- Rasterization ---
+                // Timed pass 2: rasterization
                 tsc_counter rl0, rl1;
                 RDTSC(rl0);
                 for (int f = 0; f < model.nfaces(); f++) {

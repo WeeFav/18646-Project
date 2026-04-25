@@ -5,7 +5,9 @@ run_gpu:
 	./main.x utah_teapot
 
 build_cpu:
-	cd build/ && cmake --build .
+	mkdir -p build
+	cd build && cmake ..
+	cd build && cmake --build .
 
 run_cpu:
 	./build/tinyrenderer utah_teapot
