@@ -26,10 +26,10 @@ The code expects a base model name and loads files as:
 - `<base_name>_128.obj`
 
 In this repository, Utah teapot files are under:
-- `./utah_teapot_scaled_16.obj`
-- `./utah_teapot_scaled_32.obj`
-- `./utah_teapot_scaled_64.obj`
-- `./utah_teapot_scaled_128.obj`
+- `./utah_teapot_16.obj`
+- `./utah_teapot_32.obj`
+- `./utah_teapot_64.obj`
+- `./utah_teapot_128.obj`
 
 
 ## Build and Run: GPU (CUDA)
