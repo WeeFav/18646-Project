@@ -19,6 +19,18 @@ Recommended environment:
 
 ## Input Model Naming
 
+Data Preprocessing: The script generates a scaled OBJ for 
+better visualization (model appears less zoomed/cropped)
+
+```bash
+python3 scale_obj.py
+```
+
+By default, `scale_obj.py` reads `utah_teapot_64.obj` and writes `utah_teapot_64_s.obj`.
+If needed, edit `scale`, `input_file`, and `output_file` in the script.
+
+Data Location: 
+
 The code expects a base model name and loads files as:
 - `<base_name>_16.obj`
 - `<base_name>_32.obj`
